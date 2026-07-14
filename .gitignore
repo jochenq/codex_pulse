@@ -1,0 +1,8 @@
+.DS_Store
+*.zip
+*.xcarchive
+DerivedData/
+build/
+Codex Pulse Monitor.app/
+requests.jsonl
+scan-state.json
