@@ -217,7 +217,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         header.alignment = .leading
         header.spacing = 4
 
-        let explanation = NSTextField(labelWithString: "进行中的请求会置顶；Token 会随 Codex 本地事件更新，首响应时间在请求完成后确定。")
+        let explanation = NSTextField(labelWithString: "所有请求按包含年份的完整开始时间倒序排列；今天省略日期，今年省略年份。")
         explanation.font = .systemFont(ofSize: 11)
         explanation.textColor = .secondaryLabelColor
         configureConsoleTable()
@@ -321,7 +321,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         consoleTable.usesAlternatingRowBackgroundColors = true
         consoleTable.rowHeight = 27
         addColumns([
-            ("live_status", "状态", 78), ("live_time", "开始时间", 90),
+            ("live_status", "状态", 78), ("live_time", "开始时间", 160),
             ("live_model", "模型", 160), ("live_effort", "推理等级", 78),
             ("live_calls", "模型调用", 78),
             ("live_ttft", "首响应", 82), ("live_duration", "已用时间", 82),
@@ -392,12 +392,12 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
                        effort: $0.effort, ttftMS: nil, durationMS: elapsedMS(since: $0.timestamp), usage: $0.usage,
                        modelCalls: $0.modelCalls)
         }
-        let completedRows = allRecords.lazy.filter { !liveIDs.contains($0.turnID) }.prefix(200).map {
+        let completedRows = allRecords.filter { !liveIDs.contains($0.turnID) }.map {
             ConsoleRow(isLive: false, turnID: $0.turnID, timestamp: $0.timestamp, model: $0.model,
                        effort: $0.effort, ttftMS: $0.ttftMS, durationMS: $0.durationMS, usage: $0.usage,
                        modelCalls: $0.modelCalls ?? 0)
         }
-        consoleRows = liveRows + completedRows
+        consoleRows = Array((liveRows + completedRows).sorted(by: consoleRowIsNewer).prefix(200))
         consoleStatusLabel.stringValue = "每 2 秒刷新 · 进行中 \(liveRows.count) · 显示最近 \(consoleRows.count) 条"
         consoleTable.reloadData()
     }
@@ -866,8 +866,29 @@ private func fullDayLabel(_ date: Date) -> String {
     return formatter.string(from: date)
 }
 
+private func consoleRowIsNewer(_ lhs: ConsoleRow, _ rhs: ConsoleRow) -> Bool {
+    switch (metricDate(lhs.timestamp), metricDate(rhs.timestamp)) {
+    case let (left?, right?):
+        if left != right { return left > right }
+    case (_?, nil): return true
+    case (nil, _?): return false
+    case (nil, nil): break
+    }
+    return lhs.timestamp > rhs.timestamp
+}
+
 private func clockLabel(_ timestamp: String) -> String {
     guard let date = metricDate(timestamp) else { return "--" }
-    let formatter = DateFormatter(); formatter.locale = Locale(identifier: "zh_CN"); formatter.dateFormat = "HH:mm:ss"
+    let calendar = Calendar.current
+    let now = Date()
+    let format: String
+    if calendar.isDate(date, inSameDayAs: now) {
+        format = "HH:mm:ss"
+    } else if calendar.component(.year, from: date) == calendar.component(.year, from: now) {
+        format = "MM-dd HH:mm:ss"
+    } else {
+        format = "yyyy-MM-dd HH:mm:ss"
+    }
+    let formatter = DateFormatter(); formatter.locale = Locale(identifier: "zh_CN"); formatter.dateFormat = format
     return formatter.string(from: date)
 }
