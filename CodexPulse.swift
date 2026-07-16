@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import SQLite3
 
 struct TokenUsage: Codable {
     var input = 0
@@ -31,6 +32,17 @@ struct LiveRequest {
     let source: String
 }
 
+struct APICallMetric: Codable {
+    let id: String
+    let sessionID: String
+    let turnID: String
+    let timestamp: String
+    let model: String
+    let effort: String
+    let usage: TokenUsage
+    let source: String
+}
+
 private struct PendingTurn {
     var id: String
     var timestamp: String
@@ -44,17 +56,23 @@ private struct PendingTurn {
 private struct ParseResult {
     var completed: [RequestMetric]
     var pending: LiveRequest?
+    var apiCalls: [APICallMetric]
 }
 
 final class MetricStore {
     private(set) var records: [RequestMetric] = []
+    private(set) var apiCalls: [APICallMetric] = []
     private var knownIDs = Set<String>()
+    private var knownAPICallIDs = Set<String>()
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
     private var scannedModificationDates: [String: Date] = [:]
     private var liveBySource: [String: LiveRequest] = [:]
+    private var cachedSessionTitles: [String: String] = [:]
+    private var titleDatabaseModificationDate: Date?
     private let usageMigrationKey = "turn-token-usage-delta-v1"
     private let modelCallMigrationKey = "turn-model-call-count-v1"
+    private let apiCallMigrationKey = "api-call-records-v1"
 
     var liveRequests: [LiveRequest] {
         let cutoff = Date().addingTimeInterval(-6 * 60 * 60)
@@ -69,18 +87,24 @@ final class MetricStore {
 
     let directoryURL: URL
     let recordsURL: URL
+    let apiCallsURL: URL
     private let scanStateURL: URL
 
     init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         directoryURL = base.appendingPathComponent("Codex Pulse", isDirectory: true)
         recordsURL = directoryURL.appendingPathComponent("requests.jsonl")
+        apiCallsURL = directoryURL.appendingPathComponent("api-calls.jsonl")
         scanStateURL = directoryURL.appendingPathComponent("scan-state.json")
         try? FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
         if !FileManager.default.fileExists(atPath: recordsURL.path) {
             FileManager.default.createFile(atPath: recordsURL.path, contents: nil)
         }
+        if !FileManager.default.fileExists(atPath: apiCallsURL.path) {
+            FileManager.default.createFile(atPath: apiCallsURL.path, contents: nil)
+        }
         loadSavedRecords()
+        loadSavedAPICalls()
         repairUnknownRecords()
         loadScanState()
     }
@@ -108,10 +132,48 @@ final class MetricStore {
         records.sort { $0.timestamp > $1.timestamp }
     }
 
+    private func loadSavedAPICalls() {
+        guard let text = try? String(contentsOf: apiCallsURL, encoding: .utf8) else { return }
+        for line in text.split(separator: "\n") {
+            guard let data = line.data(using: .utf8),
+                  let metric = try? decoder.decode(APICallMetric.self, from: data) else { continue }
+            apiCalls.append(metric)
+            knownAPICallIDs.insert(metric.id)
+        }
+        apiCalls.sort { $0.timestamp > $1.timestamp }
+    }
+
+    func sessionTitles() -> [String: String] {
+        let databaseURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/state_5.sqlite")
+        let walURL = URL(fileURLWithPath: databaseURL.path + "-wal")
+        let databaseModified = try? databaseURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+        let walModified = try? walURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+        let modified = [databaseModified, walModified].compactMap { $0 }.max()
+        if modified == titleDatabaseModificationDate, !cachedSessionTitles.isEmpty { return cachedSessionTitles }
+        var database: OpaquePointer?
+        guard sqlite3_open_v2(databaseURL.path, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
+              let database else { return cachedSessionTitles }
+        defer { sqlite3_close(database) }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, "SELECT id, title FROM threads", -1, &statement, nil) == SQLITE_OK,
+              let statement else { return cachedSessionTitles }
+        defer { sqlite3_finalize(statement) }
+        var titles: [String: String] = [:]
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let idText = sqlite3_column_text(statement, 0),
+                  let titleText = sqlite3_column_text(statement, 1) else { continue }
+            titles[String(cString: idText)] = String(cString: titleText)
+        }
+        cachedSessionTitles = titles
+        titleDatabaseModificationDate = modified
+        return titles
+    }
+
     @discardableResult
     func importCodexHistory() -> Int {
         if !UserDefaults.standard.bool(forKey: usageMigrationKey)
-            || !UserDefaults.standard.bool(forKey: modelCallMigrationKey) {
+            || !UserDefaults.standard.bool(forKey: modelCallMigrationKey)
+            || !UserDefaults.standard.bool(forKey: apiCallMigrationKey) {
             return rebuildAllHistoryWithTurnDeltas()
         }
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -137,10 +199,12 @@ final class MetricStore {
         }
 
         var imported: [RequestMetric] = []
+        var importedAPICalls: [APICallMetric] = []
         for file in files {
             autoreleasepool {
                 let parsed = parse(file: file)
                 imported.append(contentsOf: parsed.completed)
+                importedAPICalls.append(contentsOf: parsed.apiCalls)
                 liveBySource[file.path] = parsed.pending
             }
         }
@@ -148,6 +212,10 @@ final class MetricStore {
         imported.sort { $0.timestamp < $1.timestamp }
         for metric in imported { append(metric) }
         records.sort { $0.timestamp > $1.timestamp }
+        importedAPICalls = importedAPICalls.filter { !knownAPICallIDs.contains($0.id) }
+        importedAPICalls.sort { $0.timestamp < $1.timestamp }
+        for metric in importedAPICalls { appendAPICall(metric) }
+        apiCalls.sort { $0.timestamp > $1.timestamp }
         saveScanState()
         return imported.count
     }
@@ -159,6 +227,7 @@ final class MetricStore {
             home.appendingPathComponent(".codex/archived_sessions", isDirectory: true)
         ]
         var rebuiltByID: [String: RequestMetric] = [:]
+        var rebuiltAPICallsByID: [String: APICallMetric] = [:]
         var rebuiltLive: [String: LiveRequest] = [:]
         var rebuiltDates: [String: Date] = [:]
         for root in roots {
@@ -171,6 +240,7 @@ final class MetricStore {
                 autoreleasepool {
                     let parsed = parse(file: file)
                     for metric in parsed.completed { rebuiltByID[metric.turnID] = metric }
+                    for metric in parsed.apiCalls { rebuiltAPICallsByID[metric.id] = metric }
                     if let pending = parsed.pending { rebuiltLive[file.path] = pending }
                     let values = try? file.resourceValues(forKeys: [.contentModificationDateKey])
                     rebuiltDates[file.path] = values?.contentModificationDate ?? .distantPast
@@ -179,21 +249,27 @@ final class MetricStore {
         }
         records = Array(rebuiltByID.values).sorted { $0.timestamp > $1.timestamp }
         knownIDs = Set(rebuiltByID.keys)
+        apiCalls = Array(rebuiltAPICallsByID.values).sorted { $0.timestamp > $1.timestamp }
+        knownAPICallIDs = Set(rebuiltAPICallsByID.keys)
         liveBySource = rebuiltLive
         scannedModificationDates = rebuiltDates
         rewriteRecords()
+        rewriteAPICalls()
         saveScanState()
         UserDefaults.standard.set(true, forKey: usageMigrationKey)
         UserDefaults.standard.set(true, forKey: modelCallMigrationKey)
+        UserDefaults.standard.set(true, forKey: apiCallMigrationKey)
         return records.count
     }
 
     private func parse(file: URL) -> ParseResult {
         guard let text = try? String(contentsOf: file, encoding: .utf8) else {
-            return ParseResult(completed: [], pending: nil)
+            return ParseResult(completed: [], pending: nil, apiCalls: [])
         }
         var pending: PendingTurn?
         var result: [RequestMetric] = []
+        var apiCallResult: [APICallMetric] = []
+        var sessionID = file.deletingPathExtension().lastPathComponent.split(separator: "-").last.map(String.init) ?? file.lastPathComponent
         var lastModel: String?
         var lastEffort: String?
         var sessionUsage = TokenUsage()
@@ -204,6 +280,11 @@ final class MetricStore {
                   let type = object["type"] as? String else { continue }
             let timestamp = object["timestamp"] as? String ?? ""
             guard let payload = object["payload"] as? [String: Any] else { continue }
+
+            if type == "session_meta" {
+                sessionID = payload["id"] as? String ?? payload["session_id"] as? String ?? sessionID
+                continue
+            }
 
             if type == "event_msg", let eventType = payload["type"] as? String {
                 switch eventType {
@@ -231,6 +312,18 @@ final class MetricStore {
                     if let lastUsage = info["last_token_usage"] as? [String: Any],
                        int(lastUsage["total_tokens"]) > 0 {
                         turn.modelCalls += 1
+                        apiCallResult.append(APICallMetric(
+                            id: "\(sessionID):\(timestamp)", sessionID: sessionID, turnID: turn.id,
+                            timestamp: timestamp, model: turn.model, effort: turn.effort,
+                            usage: TokenUsage(
+                                input: int(lastUsage["input_tokens"]),
+                                cached: int(lastUsage["cached_input_tokens"]),
+                                output: int(lastUsage["output_tokens"]),
+                                reasoning: int(lastUsage["reasoning_output_tokens"]),
+                                total: int(lastUsage["total_tokens"])
+                            ),
+                            source: file.path
+                        ))
                     }
                     pending = turn
                 case "task_complete":
@@ -274,7 +367,7 @@ final class MetricStore {
                 source: file.path
             )
         }
-        return ParseResult(completed: result, pending: live)
+        return ParseResult(completed: result, pending: live, apiCalls: apiCallResult)
     }
 
     private func repairUnknownRecords() {
@@ -308,11 +401,32 @@ final class MetricStore {
         try? data.write(to: recordsURL, options: .atomic)
     }
 
+    private func rewriteAPICalls() {
+        var data = Data()
+        for record in apiCalls.sorted(by: { $0.timestamp < $1.timestamp }) {
+            guard let encoded = try? encoder.encode(record) else { continue }
+            data.append(encoded)
+            data.append(0x0a)
+        }
+        try? data.write(to: apiCallsURL, options: .atomic)
+    }
+
     private func append(_ metric: RequestMetric) {
         guard knownIDs.insert(metric.turnID).inserted,
               let data = try? encoder.encode(metric) else { return }
         records.append(metric)
         if let handle = try? FileHandle(forWritingTo: recordsURL) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data + Data([0x0a]))
+        }
+    }
+
+    private func appendAPICall(_ metric: APICallMetric) {
+        guard knownAPICallIDs.insert(metric.id).inserted,
+              let data = try? encoder.encode(metric) else { return }
+        apiCalls.append(metric)
+        if let handle = try? FileHandle(forWritingTo: apiCallsURL) {
             defer { try? handle.close() }
             _ = try? handle.seekToEnd()
             try? handle.write(contentsOf: data + Data([0x0a]))
@@ -359,7 +473,7 @@ final class RateLimitReader {
                         "clientInfo": [
                             "name": "codex_pulse_monitor",
                             "title": "Codex Pulse Monitor",
-                            "version": "2.6.0"
+                            "version": "2.7.0"
                         ]
                     ]
                 ],
@@ -454,16 +568,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             _ = self.store.importCodexHistory()
             let records = self.store.records
-            let live = self.store.liveRequests
+            let apiCalls = self.store.apiCalls
+            let titles = self.store.sessionTitles()
             DispatchQueue.main.async {
-                self.statsController?.update(records: records, liveRequests: live)
+                self.statsController?.update(records: records, apiCalls: apiCalls, sessionTitles: titles)
                 self.isLivePolling = false
             }
         }
     }
 
     private func rebuildMenu() {
-        statsController?.update(records: store.records, liveRequests: store.liveRequests)
+        statsController?.update(records: store.records, apiCalls: store.apiCalls, sessionTitles: store.sessionTitles())
         let menu = NSMenu()
         menu.addItem(disabled("Codex Pulse"))
         menu.addItem(.separator())
@@ -525,9 +640,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showStats() {
         if statsController == nil {
-            statsController = StatsWindowController(records: store.records, liveRequests: store.liveRequests)
+            statsController = StatsWindowController(records: store.records, apiCalls: store.apiCalls, sessionTitles: store.sessionTitles())
         } else {
-            statsController?.update(records: store.records, liveRequests: store.liveRequests)
+            statsController?.update(records: store.records, apiCalls: store.apiCalls, sessionTitles: store.sessionTitles())
         }
         statsController?.showOverview()
         statsController?.showWindow(nil)

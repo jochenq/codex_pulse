@@ -25,20 +25,18 @@ private struct DailyPoint {
 }
 
 private struct ConsoleRow {
-    let isLive: Bool
-    let turnID: String
+    let id: String
+    let sessionName: String
     let timestamp: String
     let model: String
     let effort: String
-    let ttftMS: Int?
-    let durationMS: Int
     let usage: TokenUsage
-    let modelCalls: Int
 }
 
 final class StatsWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
     private var allRecords: [RequestMetric] = []
-    private var liveRequests: [LiveRequest] = []
+    private var apiCalls: [APICallMetric] = []
+    private var sessionTitles: [String: String] = [:]
     private var filteredRecords: [RequestMetric] = []
     private var groupRows: [GroupStats] = []
     private var consoleRows: [ConsoleRow] = []
@@ -53,12 +51,17 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
     private var summaryValues: [NSTextField] = []
     private let subtitleLabel = NSTextField(labelWithString: "")
     private let consoleStatusLabel = NSTextField(labelWithString: "")
+    private let consolePageLabel = NSTextField(labelWithString: "")
+    private lazy var previousPageButton = NSButton(title: "‹ 上一页", target: self, action: #selector(previousConsolePage))
+    private lazy var nextPageButton = NSButton(title: "下一页 ›", target: self, action: #selector(nextConsolePage))
+    private let consolePageSize = 100
+    private var consolePage = 0
 
     var isLiveConsoleVisible: Bool {
         window?.isVisible == true && (tabs.selectedTabViewItem?.identifier as? String) == "console"
     }
 
-    init(records: [RequestMetric], liveRequests: [LiveRequest]) {
+    init(records: [RequestMetric], apiCalls: [APICallMetric], sessionTitles: [String: String]) {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1100, height: 740),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -70,15 +73,16 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         window.isReleasedWhenClosed = false
         super.init(window: window)
         buildInterface()
-        update(records: records, liveRequests: liveRequests)
+        update(records: records, apiCalls: apiCalls, sessionTitles: sessionTitles)
         window.center()
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    func update(records: [RequestMetric], liveRequests: [LiveRequest]) {
+    func update(records: [RequestMetric], apiCalls: [APICallMetric], sessionTitles: [String: String]) {
         allRecords = records
-        self.liveRequests = liveRequests
+        self.apiCalls = apiCalls
+        self.sessionTitles = sessionTitles
         rebuildFilterChoices()
         applyFilters()
         rebuildConsole()
@@ -208,16 +212,30 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
     }
 
     private func buildConsole(in content: NSView) {
-        let title = NSTextField(labelWithString: "实时请求控制台")
+        let title = NSTextField(labelWithString: "实时 API 请求")
         title.font = .systemFont(ofSize: 24, weight: .semibold)
         consoleStatusLabel.font = .systemFont(ofSize: 12)
         consoleStatusLabel.textColor = .secondaryLabelColor
-        let header = NSStackView(views: [title, consoleStatusLabel])
+        consolePageLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        consolePageLabel.textColor = .secondaryLabelColor
+        previousPageButton.controlSize = .small
+        nextPageButton.controlSize = .small
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let pager = NSStackView(views: [previousPageButton, consolePageLabel, nextPageButton])
+        pager.orientation = .horizontal
+        pager.alignment = .centerY
+        pager.spacing = 8
+        let statusRow = NSStackView(views: [consoleStatusLabel, spacer, pager])
+        statusRow.orientation = .horizontal
+        statusRow.alignment = .centerY
+        statusRow.spacing = 8
+        let header = NSStackView(views: [title, statusRow])
         header.orientation = .vertical
         header.alignment = .leading
         header.spacing = 4
 
-        let explanation = NSTextField(labelWithString: "所有请求按包含年份的完整开始时间倒序排列；今天省略日期，今年省略年份。")
+        let explanation = NSTextField(labelWithString: "每行是一笔底层 API 请求，按完整时间倒序；每页 100 条，表格仅创建可见行。")
         explanation.font = .systemFont(ofSize: 11)
         explanation.textColor = .secondaryLabelColor
         configureConsoleTable()
@@ -235,6 +253,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
             stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 14),
             stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
             header.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            statusRow.widthAnchor.constraint(equalTo: header.widthAnchor),
             explanation.widthAnchor.constraint(equalTo: stack.widthAnchor),
             scroll.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
@@ -319,16 +338,13 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         consoleTable.delegate = self
         consoleTable.dataSource = self
         consoleTable.usesAlternatingRowBackgroundColors = true
-        consoleTable.rowHeight = 27
+        consoleTable.rowHeight = 24
         addColumns([
-            ("live_status", "状态", 78), ("live_time", "开始时间", 160),
-            ("live_model", "模型", 160), ("live_effort", "推理等级", 78),
-            ("live_calls", "模型调用", 78),
-            ("live_ttft", "首响应", 82), ("live_duration", "已用时间", 82),
-            ("live_input", "输入", 78), ("live_cached", "缓存", 78),
-            ("live_output", "输出", 72), ("live_reasoning", "推理", 72),
-            ("live_total", "总 Token", 82), ("live_value", "价值相当于", 90),
-            ("live_turn", "Turn ID", 210)
+            ("api_time", "时间", 130), ("api_session", "会话", 130),
+            ("api_model", "模型", 118), ("api_effort", "等级", 58),
+            ("api_input", "输入", 68), ("api_cached", "缓存", 68),
+            ("api_output", "输出", 64), ("api_reasoning", "推理", 64),
+            ("api_total", "总 Token", 74), ("api_value", "价值", 78)
         ], to: consoleTable)
     }
 
@@ -337,7 +353,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
             let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
             column.title = title
             column.width = width
-            column.minWidth = id.contains("group") || id.contains("model") || id.contains("turn") ? 120 : 58
+            column.minWidth = id.contains("group") || id.contains("model") || id.contains("session") ? 100 : 52
             table.addTableColumn(column)
         }
     }
@@ -386,20 +402,34 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
     }
 
     private func rebuildConsole() {
-        let liveIDs = Set(liveRequests.map(\.turnID))
-        let liveRows = liveRequests.map {
-            ConsoleRow(isLive: true, turnID: $0.turnID, timestamp: $0.timestamp, model: $0.model,
-                       effort: $0.effort, ttftMS: nil, durationMS: elapsedMS(since: $0.timestamp), usage: $0.usage,
-                       modelCalls: $0.modelCalls)
+        let pageCount = max(1, Int(ceil(Double(apiCalls.count) / Double(consolePageSize))))
+        consolePage = min(consolePage, pageCount - 1)
+        let start = consolePage * consolePageSize
+        let end = min(start + consolePageSize, apiCalls.count)
+        let pageCalls = start < end ? apiCalls[start..<end] : apiCalls[0..<0]
+        consoleRows = pageCalls.map {
+            let fullTitle = sessionTitles[$0.sessionID] ?? $0.sessionID
+            return ConsoleRow(id: $0.id, sessionName: fullTitle, timestamp: $0.timestamp,
+                              model: $0.model, effort: $0.effort, usage: $0.usage)
         }
-        let completedRows = allRecords.filter { !liveIDs.contains($0.turnID) }.map {
-            ConsoleRow(isLive: false, turnID: $0.turnID, timestamp: $0.timestamp, model: $0.model,
-                       effort: $0.effort, ttftMS: $0.ttftMS, durationMS: $0.durationMS, usage: $0.usage,
-                       modelCalls: $0.modelCalls ?? 0)
-        }
-        consoleRows = Array((liveRows + completedRows).sorted(by: consoleRowIsNewer).prefix(200))
-        consoleStatusLabel.stringValue = "每 2 秒刷新 · 进行中 \(liveRows.count) · 显示最近 \(consoleRows.count) 条"
+        consoleStatusLabel.stringValue = "每 2 秒刷新 · 共 \(fullNumber(apiCalls.count)) 次 API 请求"
+        consolePageLabel.stringValue = "\(consolePage + 1) / \(pageCount)"
+        previousPageButton.isEnabled = consolePage > 0
+        nextPageButton.isEnabled = consolePage + 1 < pageCount
         consoleTable.reloadData()
+    }
+
+    @objc private func previousConsolePage() {
+        guard consolePage > 0 else { return }
+        consolePage -= 1
+        rebuildConsole()
+    }
+
+    @objc private func nextConsolePage() {
+        let pageCount = max(1, Int(ceil(Double(apiCalls.count) / Double(consolePageSize))))
+        guard consolePage + 1 < pageCount else { return }
+        consolePage += 1
+        rebuildConsole()
     }
 
     private func grouped(_ records: [RequestMetric]) -> [GroupStats] {
@@ -516,31 +546,29 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         let cell = reusableCell(in: consoleTable, id: id)
         let value: String
         switch id.rawValue {
-        case "live_status": value = item.isLive ? "● 进行中" : "已完成"
-        case "live_time": value = clockLabel(item.timestamp)
-        case "live_model": value = item.model
-        case "live_effort": value = item.effort
-        case "live_calls": value = compactNumber(item.modelCalls)
-        case "live_ttft": value = item.ttftMS.map(formatDuration) ?? "--"
-        case "live_duration": value = formatDuration(item.durationMS)
-        case "live_input": value = compactNumber(item.usage.input)
-        case "live_cached": value = compactNumber(item.usage.cached)
-        case "live_output": value = compactNumber(item.usage.output)
-        case "live_reasoning": value = compactNumber(item.usage.reasoning)
-        case "live_total": value = compactNumber(item.usage.total)
-        case "live_value": value = formatUSD(estimatedAPICost(model: item.model, usage: item.usage))
-        case "live_turn": value = item.turnID
+        case "api_time": value = clockLabel(item.timestamp)
+        case "api_session": value = compactSessionTitle(item.sessionName)
+        case "api_model": value = item.model
+        case "api_effort": value = item.effort
+        case "api_input": value = compactNumber(item.usage.input)
+        case "api_cached": value = compactNumber(item.usage.cached)
+        case "api_output": value = compactNumber(item.usage.output)
+        case "api_reasoning": value = compactNumber(item.usage.reasoning)
+        case "api_total": value = compactNumber(item.usage.total)
+        case "api_value": value = formatUSD(estimatedAPICost(model: item.model, usage: item.usage))
         default: value = ""
         }
         cell.textField?.stringValue = value
-        cell.textField?.alignment = ["live_calls", "live_input", "live_cached", "live_output", "live_reasoning", "live_total", "live_value"].contains(id.rawValue) ? .right : .left
-        cell.textField?.textColor = item.isLive && id.rawValue == "live_status" ? .controlAccentColor : .labelColor
-        if id.rawValue == "live_calls" {
-            cell.toolTip = fullNumber(item.modelCalls) + " 次模型调用"
-        } else if ["live_input", "live_cached", "live_output", "live_reasoning", "live_total"].contains(id.rawValue) {
-            let exact: Int = id.rawValue == "live_input" ? item.usage.input : id.rawValue == "live_cached" ? item.usage.cached : id.rawValue == "live_output" ? item.usage.output : id.rawValue == "live_reasoning" ? item.usage.reasoning : item.usage.total
+        cell.textField?.alignment = ["api_input", "api_cached", "api_output", "api_reasoning", "api_total", "api_value"].contains(id.rawValue) ? .right : .left
+        cell.textField?.textColor = .labelColor
+        if id.rawValue == "api_session" {
+            cell.toolTip = item.sessionName
+        } else if id.rawValue == "api_time" {
+            cell.toolTip = item.timestamp
+        } else if ["api_input", "api_cached", "api_output", "api_reasoning", "api_total"].contains(id.rawValue) {
+            let exact: Int = id.rawValue == "api_input" ? item.usage.input : id.rawValue == "api_cached" ? item.usage.cached : id.rawValue == "api_output" ? item.usage.output : id.rawValue == "api_reasoning" ? item.usage.reasoning : item.usage.total
             cell.toolTip = fullNumber(exact) + " Token"
-        } else if id.rawValue == "live_value" {
+        } else if id.rawValue == "api_value" {
             cell.toolTip = pricingTooltip(model: item.model, value: estimatedAPICost(model: item.model, usage: item.usage))
         } else { cell.toolTip = nil }
         return cell
@@ -551,7 +579,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         cell.identifier = id
         if cell.textField == nil {
             let text = NSTextField(labelWithString: "")
-            text.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+            text.font = table === consoleTable ? .monospacedDigitSystemFont(ofSize: 11, weight: .regular) : .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
             text.translatesAutoresizingMaskIntoConstraints = false
             text.lineBreakMode = .byTruncatingTail
             cell.addSubview(text)
@@ -812,6 +840,7 @@ private func apiPrice(for rawModel: String) -> APIPrice? {
 
 private func estimatedAPICost(model: String, usage: TokenUsage) -> Double? {
     guard let price = apiPrice(for: model) else { return nil }
+    guard usage.total == 0 || usage.input > 0 || usage.output > 0 else { return nil }
     let cachedTokens = min(max(usage.cached, 0), max(usage.input, 0))
     let uncachedTokens = max(usage.input - cachedTokens, 0)
     return (Double(uncachedTokens) * price.input
@@ -834,9 +863,10 @@ private func formatUSD(_ value: Double?) -> String {
 }
 
 private func pricingTooltip(model: String, value: Double?) -> String {
-    guard let price = apiPrice(for: model), let value else {
+    guard let price = apiPrice(for: model) else {
         return "没有可匹配的 OpenAI 官方 API 价格，暂不估算"
     }
+    guard let value else { return "该调用缺少输入与输出 Token 拆分，无法可靠估算价值" }
     let mapping = model.lowercased() == "codex-auto-review" ? "；codex-auto-review 按 GPT-5.3-Codex 计算" : ""
     return String(format: "%@ 标准 API 价：输入 $%.3g/M · 缓存 $%.3g/M · 输出 $%.3g/M%@\n（总输入 − 缓存输入）× 输入价 + 缓存输入 × 缓存价 + 输出 × 输出价\n估算价值 %@，不代表订阅套餐的实际账单",
                   price.name, price.input, price.cached, price.output, mapping, formatUSD(value))
@@ -866,17 +896,6 @@ private func fullDayLabel(_ date: Date) -> String {
     return formatter.string(from: date)
 }
 
-private func consoleRowIsNewer(_ lhs: ConsoleRow, _ rhs: ConsoleRow) -> Bool {
-    switch (metricDate(lhs.timestamp), metricDate(rhs.timestamp)) {
-    case let (left?, right?):
-        if left != right { return left > right }
-    case (_?, nil): return true
-    case (nil, _?): return false
-    case (nil, nil): break
-    }
-    return lhs.timestamp > rhs.timestamp
-}
-
 private func clockLabel(_ timestamp: String) -> String {
     guard let date = metricDate(timestamp) else { return "--" }
     let calendar = Calendar.current
@@ -891,4 +910,14 @@ private func clockLabel(_ timestamp: String) -> String {
     }
     let formatter = DateFormatter(); formatter.locale = Locale(identifier: "zh_CN"); formatter.dateFormat = format
     return formatter.string(from: date)
+}
+
+private func compactSessionTitle(_ rawTitle: String) -> String {
+    var title = rawTitle.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+    if title.hasPrefix("["), let closing = title.range(of: "](") {
+        title = String(title[title.index(after: title.startIndex)..<closing.lowerBound])
+    }
+    let limit = 14
+    guard title.count > limit else { return title }
+    return String(title.prefix(limit)) + "…"
 }
