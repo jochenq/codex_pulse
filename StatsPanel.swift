@@ -26,16 +26,18 @@ private struct DailyPoint {
 
 private struct ConsoleRow {
     let id: String
+    let status: String?
     let sessionName: String
     let timestamp: String
     let model: String
     let effort: String
-    let usage: TokenUsage
+    let usage: TokenUsage?
 }
 
 final class StatsWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
     private var allRecords: [RequestMetric] = []
     private var apiCalls: [APICallMetric] = []
+    private var activeAPICalls: [ActiveAPICall] = []
     private var sessionTitles: [String: String] = [:]
     private var filteredRecords: [RequestMetric] = []
     private var groupRows: [GroupStats] = []
@@ -61,7 +63,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         window?.isVisible == true && (tabs.selectedTabViewItem?.identifier as? String) == "console"
     }
 
-    init(records: [RequestMetric], apiCalls: [APICallMetric], sessionTitles: [String: String]) {
+    init(records: [RequestMetric], apiCalls: [APICallMetric], activeAPICalls: [ActiveAPICall], sessionTitles: [String: String]) {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1100, height: 740),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -73,15 +75,16 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         window.isReleasedWhenClosed = false
         super.init(window: window)
         buildInterface()
-        update(records: records, apiCalls: apiCalls, sessionTitles: sessionTitles)
+        update(records: records, apiCalls: apiCalls, activeAPICalls: activeAPICalls, sessionTitles: sessionTitles)
         window.center()
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    func update(records: [RequestMetric], apiCalls: [APICallMetric], sessionTitles: [String: String]) {
+    func update(records: [RequestMetric], apiCalls: [APICallMetric], activeAPICalls: [ActiveAPICall], sessionTitles: [String: String]) {
         allRecords = records
         self.apiCalls = apiCalls
+        self.activeAPICalls = activeAPICalls
         self.sessionTitles = sessionTitles
         rebuildFilterChoices()
         applyFilters()
@@ -235,16 +238,13 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         header.alignment = .leading
         header.spacing = 4
 
-        let explanation = NSTextField(labelWithString: "每行是一笔底层 API 请求，按完整时间倒序；每页 100 条，表格仅创建可见行。")
-        explanation.font = .systemFont(ofSize: 11)
-        explanation.textColor = .secondaryLabelColor
         configureConsoleTable()
         let scroll = makeScrollView(for: consoleTable)
 
-        let stack = NSStackView(views: [header, explanation, scroll])
+        let stack = NSStackView(views: [header, scroll])
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 12
+        stack.spacing = 8
         stack.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -254,7 +254,6 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
             stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
             header.widthAnchor.constraint(equalTo: stack.widthAnchor),
             statusRow.widthAnchor.constraint(equalTo: header.widthAnchor),
-            explanation.widthAnchor.constraint(equalTo: stack.widthAnchor),
             scroll.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
     }
@@ -340,11 +339,12 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         consoleTable.usesAlternatingRowBackgroundColors = true
         consoleTable.rowHeight = 24
         addColumns([
-            ("api_time", "时间", 130), ("api_session", "会话", 130),
-            ("api_model", "模型", 118), ("api_effort", "等级", 58),
-            ("api_input", "输入", 68), ("api_cached", "缓存", 68),
-            ("api_output", "输出", 64), ("api_reasoning", "推理", 64),
-            ("api_total", "总 Token", 74), ("api_value", "价值", 78)
+            ("api_status", "状态", 64), ("api_time", "时间", 124),
+            ("api_session", "会话", 124), ("api_model", "模型", 112),
+            ("api_effort", "等级", 55), ("api_input", "输入", 64),
+            ("api_cached", "缓存", 64), ("api_output", "输出", 60),
+            ("api_reasoning", "推理", 60), ("api_total", "总 Token", 70),
+            ("api_value", "价值", 74)
         ], to: consoleTable)
     }
 
@@ -401,35 +401,108 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         subtitleLabel.stringValue = "\(compactNumber(modelCalls)) 次模型调用 · \(compactNumber(filteredRecords.count)) 个任务 · \(compactNumber(filteredRecords.reduce(0) { $0 + $1.usage.total })) Token"
     }
 
-    private func rebuildConsole() {
-        let pageCount = max(1, Int(ceil(Double(apiCalls.count) / Double(consolePageSize))))
+    private func rebuildConsole(animated: Bool = true) {
+        let totalCount = apiCalls.count + activeAPICalls.count
+        let pageCount = max(1, Int(ceil(Double(totalCount) / Double(consolePageSize))))
         consolePage = min(consolePage, pageCount - 1)
-        let start = consolePage * consolePageSize
-        let end = min(start + consolePageSize, apiCalls.count)
-        let pageCalls = start < end ? apiCalls[start..<end] : apiCalls[0..<0]
-        consoleRows = pageCalls.map {
-            let fullTitle = sessionTitles[$0.sessionID] ?? $0.sessionID
-            return ConsoleRow(id: $0.id, sessionName: fullTitle, timestamp: $0.timestamp,
-                              model: $0.model, effort: $0.effort, usage: $0.usage)
-        }
-        consoleStatusLabel.stringValue = "每 2 秒刷新 · 共 \(fullNumber(apiCalls.count)) 次 API 请求"
+        let newRows = consoleRowsForCurrentPage()
+        applyConsoleRows(newRows, animated: animated && consolePage == 0)
+        let activeSuffix = activeAPICalls.isEmpty ? "" : " · \(activeAPICalls.count) 进行中"
+        consoleStatusLabel.stringValue = "\(fullNumber(apiCalls.count)) 次 API 请求\(activeSuffix)"
         consolePageLabel.stringValue = "\(consolePage + 1) / \(pageCount)"
         previousPageButton.isEnabled = consolePage > 0
         nextPageButton.isEnabled = consolePage + 1 < pageCount
-        consoleTable.reloadData()
+    }
+
+    private func consoleRowsForCurrentPage() -> [ConsoleRow] {
+        let start = consolePage * consolePageSize
+        let end = min(start + consolePageSize, apiCalls.count + activeAPICalls.count)
+        guard start < end else { return [] }
+        var activeIndex = 0
+        var completedIndex = 0
+        var mergedIndex = 0
+        var rows: [ConsoleRow] = []
+        rows.reserveCapacity(end - start)
+        while mergedIndex < end {
+            let useActive: Bool
+            if activeIndex >= activeAPICalls.count {
+                useActive = false
+            } else if completedIndex >= apiCalls.count {
+                useActive = true
+            } else {
+                useActive = activeAPICalls[activeIndex].timestamp >= apiCalls[completedIndex].timestamp
+            }
+            if useActive {
+                let call = activeAPICalls[activeIndex]
+                if mergedIndex >= start {
+                    rows.append(ConsoleRow(id: call.id, status: call.status,
+                                           sessionName: sessionTitles[call.sessionID] ?? call.sessionID,
+                                           timestamp: call.timestamp, model: call.model,
+                                           effort: call.effort, usage: nil))
+                }
+                activeIndex += 1
+            } else {
+                let call = apiCalls[completedIndex]
+                if mergedIndex >= start {
+                    rows.append(ConsoleRow(id: call.id, status: nil,
+                                           sessionName: sessionTitles[call.sessionID] ?? call.sessionID,
+                                           timestamp: call.timestamp, model: call.model,
+                                           effort: call.effort, usage: call.usage))
+                }
+                completedIndex += 1
+            }
+            mergedIndex += 1
+        }
+        return rows
+    }
+
+    private func applyConsoleRows(_ newRows: [ConsoleRow], animated: Bool) {
+        let oldRows = consoleRows
+        guard animated, !oldRows.isEmpty else {
+            consoleRows = newRows
+            consoleTable.reloadData()
+            return
+        }
+        let oldIDs = oldRows.map(\.id)
+        let newIDs = newRows.map(\.id)
+        let oldSet = Set(oldIDs)
+        let newSet = Set(newIDs)
+        guard oldIDs.filter(newSet.contains) == newIDs.filter(oldSet.contains) else {
+            consoleRows = newRows
+            consoleTable.reloadData()
+            return
+        }
+        let removals = IndexSet(oldIDs.indices.filter { !newSet.contains(oldIDs[$0]) })
+        let insertions = IndexSet(newIDs.indices.filter { !oldSet.contains(newIDs[$0]) })
+        let oldByID = Dictionary(uniqueKeysWithValues: oldRows.map { ($0.id, $0) })
+        let statusChanges = IndexSet(newRows.indices.filter {
+            guard let old = oldByID[newRows[$0].id] else { return false }
+            return old.status != newRows[$0].status
+        })
+        consoleRows = newRows
+        if !removals.isEmpty || !insertions.isEmpty {
+            consoleTable.beginUpdates()
+            consoleTable.removeRows(at: removals, withAnimation: [])
+            consoleTable.insertRows(at: insertions, withAnimation: [.slideDown, .effectFade])
+            consoleTable.endUpdates()
+        }
+        if !statusChanges.isEmpty {
+            consoleTable.reloadData(forRowIndexes: statusChanges,
+                                    columnIndexes: IndexSet(integersIn: 0..<consoleTable.numberOfColumns))
+        }
     }
 
     @objc private func previousConsolePage() {
         guard consolePage > 0 else { return }
         consolePage -= 1
-        rebuildConsole()
+        rebuildConsole(animated: false)
     }
 
     @objc private func nextConsolePage() {
-        let pageCount = max(1, Int(ceil(Double(apiCalls.count) / Double(consolePageSize))))
+        let pageCount = max(1, Int(ceil(Double(apiCalls.count + activeAPICalls.count) / Double(consolePageSize))))
         guard consolePage + 1 < pageCount else { return }
         consolePage += 1
-        rebuildConsole()
+        rebuildConsole(animated: false)
     }
 
     private func grouped(_ records: [RequestMetric]) -> [GroupStats] {
@@ -544,32 +617,34 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         let item = consoleRows[row]
         let id = column.identifier
         let cell = reusableCell(in: consoleTable, id: id)
+        let usage = item.usage
         let value: String
         switch id.rawValue {
+        case "api_status": value = item.status.map { "● \($0)" } ?? ""
         case "api_time": value = clockLabel(item.timestamp)
         case "api_session": value = compactSessionTitle(item.sessionName)
         case "api_model": value = item.model
         case "api_effort": value = item.effort
-        case "api_input": value = compactNumber(item.usage.input)
-        case "api_cached": value = compactNumber(item.usage.cached)
-        case "api_output": value = compactNumber(item.usage.output)
-        case "api_reasoning": value = compactNumber(item.usage.reasoning)
-        case "api_total": value = compactNumber(item.usage.total)
-        case "api_value": value = formatUSD(estimatedAPICost(model: item.model, usage: item.usage))
+        case "api_input": value = usage.map { compactNumber($0.input) } ?? "--"
+        case "api_cached": value = usage.map { compactNumber($0.cached) } ?? "--"
+        case "api_output": value = usage.map { compactNumber($0.output) } ?? "--"
+        case "api_reasoning": value = usage.map { compactNumber($0.reasoning) } ?? "--"
+        case "api_total": value = usage.map { compactNumber($0.total) } ?? "--"
+        case "api_value": value = usage.map { formatUSD(estimatedAPICost(model: item.model, usage: $0)) } ?? "--"
         default: value = ""
         }
         cell.textField?.stringValue = value
         cell.textField?.alignment = ["api_input", "api_cached", "api_output", "api_reasoning", "api_total", "api_value"].contains(id.rawValue) ? .right : .left
-        cell.textField?.textColor = .labelColor
+        cell.textField?.textColor = item.status != nil && id.rawValue == "api_status" ? .controlAccentColor : .labelColor
         if id.rawValue == "api_session" {
             cell.toolTip = item.sessionName
         } else if id.rawValue == "api_time" {
             cell.toolTip = item.timestamp
-        } else if ["api_input", "api_cached", "api_output", "api_reasoning", "api_total"].contains(id.rawValue) {
-            let exact: Int = id.rawValue == "api_input" ? item.usage.input : id.rawValue == "api_cached" ? item.usage.cached : id.rawValue == "api_output" ? item.usage.output : id.rawValue == "api_reasoning" ? item.usage.reasoning : item.usage.total
+        } else if let usage, ["api_input", "api_cached", "api_output", "api_reasoning", "api_total"].contains(id.rawValue) {
+            let exact: Int = id.rawValue == "api_input" ? usage.input : id.rawValue == "api_cached" ? usage.cached : id.rawValue == "api_output" ? usage.output : id.rawValue == "api_reasoning" ? usage.reasoning : usage.total
             cell.toolTip = fullNumber(exact) + " Token"
-        } else if id.rawValue == "api_value" {
-            cell.toolTip = pricingTooltip(model: item.model, value: estimatedAPICost(model: item.model, usage: item.usage))
+        } else if id.rawValue == "api_value", let usage {
+            cell.toolTip = pricingTooltip(model: item.model, value: estimatedAPICost(model: item.model, usage: usage))
         } else { cell.toolTip = nil }
         return cell
     }

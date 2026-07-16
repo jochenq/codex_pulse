@@ -43,6 +43,17 @@ struct APICallMetric: Codable {
     let source: String
 }
 
+struct ActiveAPICall {
+    let id: String
+    let sessionID: String
+    let turnID: String
+    let timestamp: String
+    let model: String
+    let effort: String
+    let status: String
+    let source: String
+}
+
 private struct PendingTurn {
     var id: String
     var timestamp: String
@@ -53,10 +64,16 @@ private struct PendingTurn {
     var modelCalls = 0
 }
 
+private struct PendingAPIState {
+    var timestamp: String
+    var status: String
+}
+
 private struct ParseResult {
     var completed: [RequestMetric]
     var pending: LiveRequest?
     var apiCalls: [APICallMetric]
+    var activeAPI: ActiveAPICall?
 }
 
 final class MetricStore {
@@ -68,6 +85,7 @@ final class MetricStore {
     private let encoder = JSONEncoder()
     private var scannedModificationDates: [String: Date] = [:]
     private var liveBySource: [String: LiveRequest] = [:]
+    private var activeAPIBySource: [String: ActiveAPICall] = [:]
     private var cachedSessionTitles: [String: String] = [:]
     private var titleDatabaseModificationDate: Date?
     private let usageMigrationKey = "turn-token-usage-delta-v1"
@@ -80,6 +98,17 @@ final class MetricStore {
         withFractions.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let plain = ISO8601DateFormatter()
         return liveBySource.values.filter {
+            guard let date = withFractions.date(from: $0.timestamp) ?? plain.date(from: $0.timestamp) else { return false }
+            return date >= cutoff
+        }.sorted { $0.timestamp > $1.timestamp }
+    }
+
+    var activeAPICalls: [ActiveAPICall] {
+        let cutoff = Date().addingTimeInterval(-6 * 60 * 60)
+        let withFractions = ISO8601DateFormatter()
+        withFractions.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let plain = ISO8601DateFormatter()
+        return activeAPIBySource.values.filter {
             guard let date = withFractions.date(from: $0.timestamp) ?? plain.date(from: $0.timestamp) else { return false }
             return date >= cutoff
         }.sorted { $0.timestamp > $1.timestamp }
@@ -206,6 +235,7 @@ final class MetricStore {
                 imported.append(contentsOf: parsed.completed)
                 importedAPICalls.append(contentsOf: parsed.apiCalls)
                 liveBySource[file.path] = parsed.pending
+                activeAPIBySource[file.path] = parsed.activeAPI
             }
         }
         imported = imported.filter { !knownIDs.contains($0.turnID) }
@@ -229,6 +259,7 @@ final class MetricStore {
         var rebuiltByID: [String: RequestMetric] = [:]
         var rebuiltAPICallsByID: [String: APICallMetric] = [:]
         var rebuiltLive: [String: LiveRequest] = [:]
+        var rebuiltActiveAPIs: [String: ActiveAPICall] = [:]
         var rebuiltDates: [String: Date] = [:]
         for root in roots {
             guard let enumerator = FileManager.default.enumerator(
@@ -242,6 +273,7 @@ final class MetricStore {
                     for metric in parsed.completed { rebuiltByID[metric.turnID] = metric }
                     for metric in parsed.apiCalls { rebuiltAPICallsByID[metric.id] = metric }
                     if let pending = parsed.pending { rebuiltLive[file.path] = pending }
+                    if let activeAPI = parsed.activeAPI { rebuiltActiveAPIs[file.path] = activeAPI }
                     let values = try? file.resourceValues(forKeys: [.contentModificationDateKey])
                     rebuiltDates[file.path] = values?.contentModificationDate ?? .distantPast
                 }
@@ -252,6 +284,7 @@ final class MetricStore {
         apiCalls = Array(rebuiltAPICallsByID.values).sorted { $0.timestamp > $1.timestamp }
         knownAPICallIDs = Set(rebuiltAPICallsByID.keys)
         liveBySource = rebuiltLive
+        activeAPIBySource = rebuiltActiveAPIs
         scannedModificationDates = rebuiltDates
         rewriteRecords()
         rewriteAPICalls()
@@ -264,9 +297,10 @@ final class MetricStore {
 
     private func parse(file: URL) -> ParseResult {
         guard let text = try? String(contentsOf: file, encoding: .utf8) else {
-            return ParseResult(completed: [], pending: nil, apiCalls: [])
+            return ParseResult(completed: [], pending: nil, apiCalls: [], activeAPI: nil)
         }
         var pending: PendingTurn?
+        var pendingAPIState: PendingAPIState?
         var result: [RequestMetric] = []
         var apiCallResult: [APICallMetric] = []
         var sessionID = file.deletingPathExtension().lastPathComponent.split(separator: "-").last.map(String.init) ?? file.lastPathComponent
@@ -295,6 +329,7 @@ final class MetricStore {
                         turn.effort = lastEffort ?? turn.effort
                         turn.baselineUsage = sessionUsage
                         pending = turn
+                        pendingAPIState = PendingAPIState(timestamp: timestamp, status: "请求中")
                     }
                 case "token_count":
                     guard var turn = pending,
@@ -324,6 +359,7 @@ final class MetricStore {
                             ),
                             source: file.path
                         ))
+                        pendingAPIState = PendingAPIState(timestamp: timestamp, status: "请求中")
                     }
                     pending = turn
                 case "task_complete":
@@ -342,6 +378,7 @@ final class MetricStore {
                         source: file.path
                     ))
                     pending = nil
+                    pendingAPIState = nil
                 default:
                     break
                 }
@@ -353,6 +390,19 @@ final class MetricStore {
                     turn.model = payload["model"] as? String ?? turn.model
                     turn.effort = payload["effort"] as? String ?? turn.effort
                     pending = turn
+                }
+            } else if type == "response_item", pending != nil, let itemType = payload["type"] as? String {
+                switch itemType {
+                case "custom_tool_call", "function_call":
+                    pendingAPIState?.status = "工具中"
+                case "custom_tool_call_output", "function_call_output":
+                    pendingAPIState = PendingAPIState(timestamp: timestamp, status: "请求中")
+                case "reasoning":
+                    pendingAPIState?.status = "响应中"
+                case "message" where (payload["role"] as? String) == "assistant":
+                    pendingAPIState?.status = "响应中"
+                default:
+                    break
                 }
             }
         }
@@ -367,7 +417,14 @@ final class MetricStore {
                 source: file.path
             )
         }
-        return ParseResult(completed: result, pending: live, apiCalls: apiCallResult)
+        let activeAPI = pending.flatMap { turn in
+            pendingAPIState.map {
+                ActiveAPICall(id: "active:\(sessionID):\(turn.id):\($0.timestamp)", sessionID: sessionID,
+                              turnID: turn.id, timestamp: $0.timestamp, model: turn.model,
+                              effort: turn.effort, status: $0.status, source: file.path)
+            }
+        }
+        return ParseResult(completed: result, pending: live, apiCalls: apiCallResult, activeAPI: activeAPI)
     }
 
     private func repairUnknownRecords() {
@@ -473,7 +530,7 @@ final class RateLimitReader {
                         "clientInfo": [
                             "name": "codex_pulse_monitor",
                             "title": "Codex Pulse Monitor",
-                            "version": "2.7.0"
+                            "version": "2.7.1"
                         ]
                     ]
                 ],
@@ -569,16 +626,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             _ = self.store.importCodexHistory()
             let records = self.store.records
             let apiCalls = self.store.apiCalls
+            let activeAPICalls = self.store.activeAPICalls
             let titles = self.store.sessionTitles()
             DispatchQueue.main.async {
-                self.statsController?.update(records: records, apiCalls: apiCalls, sessionTitles: titles)
+                self.statsController?.update(records: records, apiCalls: apiCalls,
+                                             activeAPICalls: activeAPICalls, sessionTitles: titles)
                 self.isLivePolling = false
             }
         }
     }
 
     private func rebuildMenu() {
-        statsController?.update(records: store.records, apiCalls: store.apiCalls, sessionTitles: store.sessionTitles())
+        statsController?.update(records: store.records, apiCalls: store.apiCalls,
+                                activeAPICalls: store.activeAPICalls, sessionTitles: store.sessionTitles())
         let menu = NSMenu()
         menu.addItem(disabled("Codex Pulse"))
         menu.addItem(.separator())
@@ -640,9 +700,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showStats() {
         if statsController == nil {
-            statsController = StatsWindowController(records: store.records, apiCalls: store.apiCalls, sessionTitles: store.sessionTitles())
+            statsController = StatsWindowController(records: store.records, apiCalls: store.apiCalls,
+                                                    activeAPICalls: store.activeAPICalls, sessionTitles: store.sessionTitles())
         } else {
-            statsController?.update(records: store.records, apiCalls: store.apiCalls, sessionTitles: store.sessionTitles())
+            statsController?.update(records: store.records, apiCalls: store.apiCalls,
+                                    activeAPICalls: store.activeAPICalls, sessionTitles: store.sessionTitles())
         }
         statsController?.showOverview()
         statsController?.showWindow(nil)
