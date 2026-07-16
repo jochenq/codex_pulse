@@ -34,6 +34,11 @@ private struct ConsoleRow {
     let usage: TokenUsage?
 }
 
+private enum MetricCardStyle {
+    case primary
+    case secondary
+}
+
 final class StatsWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
     private var allRecords: [RequestMetric] = []
     private var apiCalls: [APICallMetric] = []
@@ -49,10 +54,12 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
     private let tableView = NSTableView()
     private let consoleTable = NSTableView()
     private let chartView = DailyTokenChartView()
+    private let chartTitleLabel = NSTextField(labelWithString: "每日 Token 趋势")
     private let tabs = NSTabView()
     private var summaryValues: [NSTextField] = []
     private let subtitleLabel = NSTextField(labelWithString: "")
     private let consoleStatusLabel = NSTextField(labelWithString: "")
+    private var chartHeightConstraint: NSLayoutConstraint?
     private let consolePageLabel = NSTextField(labelWithString: "")
     private lazy var previousPageButton = NSButton(title: "‹ 上一页", target: self, action: #selector(previousConsolePage))
     private lazy var nextPageButton = NSButton(title: "下一页 ›", target: self, action: #selector(nextConsolePage))
@@ -124,8 +131,8 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
     }
 
     private func buildOverview(in content: NSView) {
-        let title = NSTextField(labelWithString: "Codex 请求统计")
-        title.font = .systemFont(ofSize: 24, weight: .semibold)
+        let title = NSTextField(labelWithString: "请求概览")
+        title.font = .systemFont(ofSize: 26, weight: .bold)
         subtitleLabel.font = .systemFont(ofSize: 12)
         subtitleLabel.textColor = .secondaryLabelColor
 
@@ -157,44 +164,59 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         header.alignment = .centerY
         header.spacing = 12
 
-        let metricDefinitions: [(String, String?)] = [
-            ("模型调用数", "每次产生非零 last_token_usage 的底层模型调用；一个 Codex 任务通常包含多次模型调用"),
-            ("总 Token", nil),
-            ("价值相当于", "计算方式：（总输入 − 缓存输入）× 输入价 + 缓存输入 × 缓存价 + 输出 × 输出价；不代表订阅套餐的实际账单"),
-            ("典型首响应", "一半请求的首响应时间不超过这个值"),
-            ("较慢请求总耗时", "95% 的请求总耗时不超过这个值"),
-            ("缓存命中率", "输入 Token 中由缓存直接复用的比例"),
-            ("推理 Token 占比", "输出 Token 中用于模型推理的比例")
-        ]
-        var cards: [NSView] = []
-        for (name, help) in metricDefinitions {
-            let (box, value) = metricBox(name, help: help)
-            cards.append(box)
-            summaryValues.append(value)
-        }
-        let summaryGrid = NSGridView(views: [Array(cards[0..<4]), Array(cards[4..<7]) + [NSView()]])
-        summaryGrid.rowSpacing = 10
-        summaryGrid.columnSpacing = 10
-        for index in 0..<4 { summaryGrid.column(at: index).xPlacement = .fill }
-        for card in cards.dropFirst() { card.widthAnchor.constraint(equalTo: cards[0].widthAnchor).isActive = true }
+        let calls = metricBox("API 请求", help: "每次产生非零 last_token_usage 的底层模型 API 调用", style: .primary)
+        let total = metricBox("总 Token", help: nil, style: .primary, highlighted: true)
+        let value = metricBox("价值相当于", help: "按 OpenAI 标准 API Token 单价估算；不代表订阅套餐的实际账单", style: .primary, highlighted: true)
+        let typical = metricBox("典型首响应", help: "一半请求的首响应时间不超过这个值", style: .secondary)
+        let slower = metricBox("P95 总耗时", help: "95% 的请求总耗时不超过这个值", style: .secondary)
+        let cache = metricBox("缓存命中率", help: "输入 Token 中由缓存直接复用的比例", style: .secondary)
+        let reasoning = metricBox("推理占比", help: "输出 Token 中用于模型推理的比例", style: .secondary)
+        summaryValues = [calls.1, total.1, value.1, typical.1, slower.1, cache.1, reasoning.1]
 
-        let chartTitle = sectionTitle("每日 Token 趋势（悬浮查看明细）")
+        let primaryCards = [total.0, value.0, calls.0]
+        let primaryGrid = NSGridView(views: [primaryCards])
+        primaryGrid.columnSpacing = 10
+        for index in primaryCards.indices { primaryGrid.column(at: index).xPlacement = .fill }
+        for card in primaryCards.dropFirst() { card.widthAnchor.constraint(equalTo: primaryCards[0].widthAnchor).isActive = true }
+
+        let secondaryCards = [typical.0, slower.0, cache.0, reasoning.0]
+        let secondaryGrid = NSGridView(views: [secondaryCards])
+        secondaryGrid.columnSpacing = 8
+        for index in secondaryCards.indices { secondaryGrid.column(at: index).xPlacement = .fill }
+        for card in secondaryCards.dropFirst() { card.widthAnchor.constraint(equalTo: secondaryCards[0].widthAnchor).isActive = true }
+
+        let summaryStack = NSStackView(views: [primaryGrid, secondaryGrid])
+        summaryStack.orientation = .vertical
+        summaryStack.alignment = .leading
+        summaryStack.spacing = 8
+        primaryGrid.widthAnchor.constraint(equalTo: summaryStack.widthAnchor).isActive = true
+        secondaryGrid.widthAnchor.constraint(equalTo: summaryStack.widthAnchor).isActive = true
+
+        chartTitleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        let chartHint = NSTextField(labelWithString: "悬浮查看明细")
+        chartHint.font = .systemFont(ofSize: 10)
+        chartHint.textColor = .tertiaryLabelColor
+        let chartHeader = NSStackView(views: [chartTitleLabel, NSView(), chartHint])
+        chartHeader.orientation = .horizontal
+        chartHeader.alignment = .centerY
         chartView.translatesAutoresizingMaskIntoConstraints = false
-        chartView.heightAnchor.constraint(equalToConstant: 150).isActive = true
+        chartHeightConstraint = chartView.heightAnchor.constraint(equalToConstant: 96)
+        chartHeightConstraint?.isActive = true
 
-        let tableTitle = sectionTitle("按模型 × 推理等级")
-        let termHelp = NSTextField(labelWithString: "典型：一半请求不超过 · 较慢：95% 请求不超过")
-        termHelp.font = .systemFont(ofSize: 11)
-        termHelp.textColor = .secondaryLabelColor
+        let tableTitle = sectionTitle("模型与推理等级")
+        let termHelp = NSTextField(labelWithString: "典型 = P50 · 较慢 = P95")
+        termHelp.font = .systemFont(ofSize: 10)
+        termHelp.textColor = .tertiaryLabelColor
         let tableHeader = NSStackView(views: [tableTitle, NSView(), termHelp])
         tableHeader.orientation = .horizontal
         tableHeader.alignment = .centerY
 
         configureStatsTable()
         let scroll = makeScrollView(for: tableView)
+        scroll.borderType = .noBorder
         scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 235).isActive = true
 
-        let stack = NSStackView(views: [header, summaryGrid, chartTitle, chartView, tableHeader, scroll])
+        let stack = NSStackView(views: [header, summaryStack, chartHeader, chartView, tableHeader, scroll])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 11
@@ -206,8 +228,8 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
             stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 14),
             stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
             header.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            summaryGrid.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            chartTitle.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            summaryStack.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            chartHeader.widthAnchor.constraint(equalTo: stack.widthAnchor),
             chartView.widthAnchor.constraint(equalTo: stack.widthAnchor),
             tableHeader.widthAnchor.constraint(equalTo: stack.widthAnchor),
             scroll.widthAnchor.constraint(equalTo: stack.widthAnchor)
@@ -269,33 +291,33 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         return stack
     }
 
-    private func metricBox(_ title: String, help: String?) -> (NSBox, NSTextField) {
+    private func metricBox(_ title: String, help: String?, style: MetricCardStyle, highlighted: Bool = false) -> (NSBox, NSTextField) {
         let box = NSBox()
         box.boxType = .custom
-        box.borderColor = .separatorColor
-        box.borderWidth = 1
-        box.cornerRadius = 8
-        box.fillColor = .controlBackgroundColor
+        box.borderColor = highlighted ? NSColor.controlAccentColor.withAlphaComponent(0.34) : NSColor.separatorColor.withAlphaComponent(0.34)
+        box.borderWidth = style == .primary ? 1 : 0
+        box.cornerRadius = style == .primary ? 10 : 8
+        box.fillColor = highlighted ? NSColor.controlAccentColor.withAlphaComponent(0.09) : NSColor.controlBackgroundColor.withAlphaComponent(style == .primary ? 0.88 : 0.55)
         box.toolTip = help
         box.translatesAutoresizingMaskIntoConstraints = false
-        box.heightAnchor.constraint(equalToConstant: 72).isActive = true
+        box.heightAnchor.constraint(equalToConstant: style == .primary ? 82 : 56).isActive = true
 
         let label = NSTextField(labelWithString: title)
-        label.font = .systemFont(ofSize: 11)
+        label.font = .systemFont(ofSize: style == .primary ? 11 : 10, weight: .medium)
         label.textColor = .secondaryLabelColor
         let value = NSTextField(labelWithString: "--")
-        value.font = .monospacedDigitSystemFont(ofSize: 22, weight: .medium)
+        value.font = .monospacedDigitSystemFont(ofSize: style == .primary ? 28 : 18, weight: style == .primary ? .semibold : .medium)
         value.lineBreakMode = .byTruncatingTail
         let stack = NSStackView(views: [label, value])
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 5
+        stack.spacing = style == .primary ? 6 : 3
         stack.translatesAutoresizingMaskIntoConstraints = false
         box.contentView?.addSubview(stack)
         if let inner = box.contentView {
             NSLayoutConstraint.activate([
-                stack.leadingAnchor.constraint(equalTo: inner.leadingAnchor, constant: 12),
-                stack.trailingAnchor.constraint(equalTo: inner.trailingAnchor, constant: -12),
+                stack.leadingAnchor.constraint(equalTo: inner.leadingAnchor, constant: style == .primary ? 14 : 12),
+                stack.trailingAnchor.constraint(equalTo: inner.trailingAnchor, constant: style == .primary ? -14 : -12),
                 stack.centerYAnchor.constraint(equalTo: inner.centerYAnchor)
             ])
         }
@@ -322,10 +344,13 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
     private func configureStatsTable() {
         tableView.delegate = self
         tableView.dataSource = self
-        tableView.usesAlternatingRowBackgroundColors = true
-        tableView.rowHeight = 27
+        tableView.usesAlternatingRowBackgroundColors = false
+        tableView.backgroundColor = .clear
+        tableView.gridStyleMask = [.solidHorizontalGridLineMask]
+        tableView.gridColor = NSColor.separatorColor.withAlphaComponent(0.45)
+        tableView.rowHeight = 30
         addColumns([
-            ("group", "模型 / 推理等级", 185), ("count", "模型调用", 78),
+            ("group", "模型 / 推理等级", 185), ("count", "API 请求", 78),
             ("total", "总 Token", 82), ("value", "价值相当于", 90), ("input", "输入", 78),
             ("output", "输出", 70), ("reasoning", "推理", 70),
             ("typical", "典型首响应", 92), ("slower", "较慢首响应", 92),
@@ -382,10 +407,22 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         let today = calendar.startOfDay(for: Date())
         let cutoff: Date?
         switch rangePopup.indexOfSelectedItem {
-        case 0: cutoff = today
-        case 1: cutoff = calendar.date(byAdding: .day, value: -6, to: today)
-        case 2: cutoff = calendar.date(byAdding: .day, value: -29, to: today)
-        default: cutoff = nil
+        case 0:
+            cutoff = today
+            chartTitleLabel.stringValue = "今日 Token"
+            chartHeightConstraint?.constant = 96
+        case 1:
+            cutoff = calendar.date(byAdding: .day, value: -6, to: today)
+            chartTitleLabel.stringValue = "每日 Token 趋势"
+            chartHeightConstraint?.constant = 128
+        case 2:
+            cutoff = calendar.date(byAdding: .day, value: -29, to: today)
+            chartTitleLabel.stringValue = "每日 Token 趋势"
+            chartHeightConstraint?.constant = 128
+        default:
+            cutoff = nil
+            chartTitleLabel.stringValue = "每日 Token 趋势"
+            chartHeightConstraint?.constant = 128
         }
         filteredRecords = allRecords.filter { record in
             if model != "全部模型" && record.model != model { return false }
@@ -398,7 +435,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         chartView.points = dailyPoints(filteredRecords)
         tableView.reloadData()
         let modelCalls = filteredRecords.reduce(0) { $0 + ($1.modelCalls ?? 0) }
-        subtitleLabel.stringValue = "\(compactNumber(modelCalls)) 次模型调用 · \(compactNumber(filteredRecords.count)) 个任务 · \(compactNumber(filteredRecords.reduce(0) { $0 + $1.usage.total })) Token"
+        subtitleLabel.stringValue = "\(compactNumber(filteredRecords.count)) 个任务 · \(compactNumber(modelCalls)) 次 API 请求"
     }
 
     private func rebuildConsole(animated: Bool = true) {
@@ -620,7 +657,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         let usage = item.usage
         let value: String
         switch id.rawValue {
-        case "api_status": value = item.status.map { "● \($0)" } ?? ""
+        case "api_status": value = item.status.map { "● \($0)" } ?? "已完成"
         case "api_time": value = clockLabel(item.timestamp)
         case "api_session": value = compactSessionTitle(item.sessionName)
         case "api_model": value = item.model
@@ -635,7 +672,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         }
         cell.textField?.stringValue = value
         cell.textField?.alignment = ["api_input", "api_cached", "api_output", "api_reasoning", "api_total", "api_value"].contains(id.rawValue) ? .right : .left
-        cell.textField?.textColor = item.status != nil && id.rawValue == "api_status" ? .controlAccentColor : .labelColor
+        cell.textField?.textColor = id.rawValue == "api_status" ? (item.status != nil ? .controlAccentColor : .secondaryLabelColor) : .labelColor
         if id.rawValue == "api_session" {
             cell.toolTip = item.sessionName
         } else if id.rawValue == "api_time" {
@@ -788,7 +825,7 @@ private final class DailyTokenChartView: NSView {
         let maxTokens = max(points.map(\.tokens).max() ?? 0, 1)
         let scale = niceTokenScale(maxTokens)
         let slot = plot.width / CGFloat(points.count)
-        let barWidth = max(2, min(18, slot * 0.64))
+        let barWidth = points.count == 1 ? 28 : max(2, min(18, slot * 0.64))
         var tick = 0.0
         while tick <= scale.maximum + scale.step * 0.01 {
             let y = plot.minY + CGFloat(tick / scale.maximum) * plot.height
@@ -807,7 +844,11 @@ private final class DailyTokenChartView: NSView {
             let x = plot.minX + CGFloat(index) * slot + (slot - barWidth) / 2
             NSBezierPath(roundedRect: NSRect(x: x, y: plot.minY, width: barWidth, height: height), xRadius: 2, yRadius: 2).fill()
         }
-        if let first = points.first, let last = points.last {
+        if points.count == 1, let item = points.first {
+            let text = dayLabel(item.date)
+            let width = (text as NSString).size(withAttributes: textAttributes(.secondaryLabelColor)).width
+            drawText(text, at: NSPoint(x: plot.midX - width / 2, y: 3), color: .secondaryLabelColor)
+        } else if let first = points.first, let last = points.last {
             drawText(dayLabel(first.date), at: NSPoint(x: plot.minX, y: 3), color: .secondaryLabelColor)
             let width = (dayLabel(last.date) as NSString).size(withAttributes: textAttributes(.secondaryLabelColor)).width
             drawText(dayLabel(last.date), at: NSPoint(x: plot.maxX - width, y: 3), color: .secondaryLabelColor)
