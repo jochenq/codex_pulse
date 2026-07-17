@@ -533,7 +533,7 @@ final class RateLimitReader {
                         "clientInfo": [
                             "name": "codex_pulse_monitor",
                             "title": "Codex Pulse Monitor",
-                            "version": "2.9.0"
+                            "version": "2.9.1"
                         ]
                     ]
                 ],
@@ -608,7 +608,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popoverController = StatusPopoverController()
         popoverController.onRefresh = { [weak self] in self?.refresh() }
         popoverController.onOpenDashboard = { [weak self] in self?.showStats() }
-        popoverController.onOpenRecords = { [weak self] in self?.openRecords() }
         popoverController.onQuit = { NSApp.terminate(nil) }
         popover = NSPopover()
         popover.behavior = .transient
@@ -623,6 +622,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.showStats() }
         }
         if CommandLine.arguments.contains("--show-popover") {
+            popover.behavior = .applicationDefined
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in self?.togglePopover() }
         }
     }
@@ -677,7 +677,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let totalModelCalls = store.records.reduce(0) { $0 + ($1.modelCalls ?? 0) }
         popoverController.update(snapshot: snapshot, totalModelCalls: totalModelCalls,
                                  taskCount: store.records.count, activeCallCount: store.activeAPICalls.count,
-                                 latest: store.records.first, refreshedAt: Date())
+                                 refreshedAt: Date())
         if let used = snapshot?.secondaryUsed ?? snapshot?.primaryUsed { statusItem.button?.title = " \(max(0, 100 - used))%" }
     }
 
@@ -715,20 +715,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 private enum MembershipReader {
     static func expiry() -> Date? {
-        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/auth.json")
-        guard let data = try? Data(contentsOf: url),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let tokens = root["tokens"] as? [String: Any],
-              let token = tokens["id_token"] as? String else { return nil }
-        let parts = token.split(separator: ".", omittingEmptySubsequences: false)
-        guard parts.count > 1 else { return nil }
-        var payload = String(parts[1]).replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
-        payload += String(repeating: "=", count: (4 - payload.count % 4) % 4)
-        guard let decoded = Data(base64Encoded: payload),
-              let claims = try? JSONSerialization.jsonObject(with: decoded) as? [String: Any],
-              let auth = claims["https://api.openai.com/auth"] as? [String: Any],
-              let value = auth["chatgpt_subscription_active_until"] as? String else { return nil }
-        return ISO8601DateFormatter().date(from: value)
+        let renewalDay = UserDefaults.standard.integer(forKey: "MembershipRenewalDay")
+        guard (1...31).contains(renewalDay) else { return nil }
+        let calendar = Calendar.current
+        let now = Date()
+        var components = calendar.dateComponents([.year, .month], from: now)
+        components.day = renewalDay
+        components.hour = 12
+        if let candidate = calendar.date(from: components), candidate > now { return candidate }
+        guard let nextMonth = calendar.date(byAdding: .month, value: 1, to: now) else { return nil }
+        components = calendar.dateComponents([.year, .month], from: nextMonth)
+        components.day = renewalDay
+        components.hour = 12
+        return calendar.date(from: components)
     }
 }
 
