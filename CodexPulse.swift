@@ -532,7 +532,7 @@ final class RateLimitReader {
                         "clientInfo": [
                             "name": "codex_pulse_monitor",
                             "title": "Codex Pulse Monitor",
-                            "version": "2.10.0"
+                            "version": "2.10.1"
                         ]
                     ]
                 ],
@@ -620,7 +620,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.imagePosition = .imageLeading
         statusItem.button?.title = " loading"
         popoverController = StatusPopoverController()
-        popoverController.onRefresh = { [weak self] in self?.popover.performClose(nil); self?.refresh() }
+        popoverController.onRefresh = { [weak self] in self?.refresh() }
         popoverController.onOpenDashboard = { [weak self] in self?.popover.performClose(nil); self?.showStats() }
         popoverController.onQuit = { NSApp.terminate(nil) }
         popover = NSPopover()
@@ -650,8 +650,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func refresh() {
         guard !isRefreshing else { return }
         isRefreshing = true
-        statusItem.button?.title = " loading"
-        popoverController.setLoading()
+        if !hasLoadedOnce {
+            statusItem.button?.title = " loading"
+            popoverController.setLoading()
+        }
         storeQueue.async { [weak self] in
             guard let self else { return }
             _ = self.store.importCodexHistory()
@@ -688,7 +690,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func togglePopover() {
-        guard !isRefreshing, hasLoadedOnce, let button = statusItem.button else { return }
+        guard hasLoadedOnce, let button = statusItem.button else { return }
         if popover.isShown {
             popover.performClose(nil)
         } else {
