@@ -964,13 +964,13 @@ private func estimatedAPICost(model: String, usage: TokenUsage) -> Double? {
             + Double(max(usage.output, 0)) * price.output) / 1_000_000
 }
 
-private func summedAPICost(_ records: [RequestMetric]) -> Double? {
+func summedAPICost(_ records: [RequestMetric]) -> Double? {
     if records.isEmpty { return 0 }
     let values = records.compactMap { estimatedAPICost(model: $0.model, usage: $0.usage) }
     return values.isEmpty ? nil : values.reduce(0, +)
 }
 
-private func formatUSD(_ value: Double?) -> String {
+func formatUSD(_ value: Double?) -> String {
     guard let value else { return "--" }
     if value > 0 && value < 0.01 { return String(format: "≈ $%.4f", value) }
     if value < 1_000 { return String(format: "≈ $%.2f", value) }

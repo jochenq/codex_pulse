@@ -501,7 +501,6 @@ final class RateLimitReader {
         var secondaryReset: Date?
         var plan: String?
         var credits: Double?
-        var membershipExpiry: Date?
         var resetCreditCount: Int?
         var resetCreditExpiry: Date?
     }
@@ -533,7 +532,7 @@ final class RateLimitReader {
                         "clientInfo": [
                             "name": "codex_pulse_monitor",
                             "title": "Codex Pulse Monitor",
-                            "version": "2.9.1"
+                            "version": "2.10.0"
                         ]
                     ]
                 ],
@@ -545,13 +544,27 @@ final class RateLimitReader {
                     input.fileHandleForWriting.write(data + Data([0x0a]))
                 }
             }
-
-            let timeout = DispatchWorkItem { if process.isRunning { process.terminate() } }
-            DispatchQueue.global().asyncAfter(deadline: .now() + 5, execute: timeout)
-            let data = output.fileHandleForReading.readDataToEndOfFile()
-            timeout.cancel()
+            let response = DispatchSemaphore(value: 0)
+            let stateQueue = DispatchQueue(label: "com.codexpulse.rate-limit-response")
+            var received = Data()
+            var decoded: Snapshot?
+            output.fileHandleForReading.readabilityHandler = { [weak self] handle in
+                let chunk = handle.availableData
+                guard !chunk.isEmpty, let self else { return }
+                stateQueue.sync {
+                    received.append(chunk)
+                    if decoded == nil, let snapshot = self.decode(received) {
+                        decoded = snapshot
+                        response.signal()
+                    }
+                }
+            }
+            _ = response.wait(timeout: .now() + 12)
+            output.fileHandleForReading.readabilityHandler = nil
+            let snapshot = stateQueue.sync { decoded }
             if process.isRunning { process.terminate() }
-            completion(self.decode(data))
+            try? input.fileHandleForWriting.close()
+            completion(snapshot)
         }
     }
 
@@ -576,7 +589,6 @@ final class RateLimitReader {
                 secondaryReset: dateValue(secondary?["resetsAt"] ?? secondary?["resets_at"]),
                 plan: (limits["planType"] ?? limits["plan_type"]) as? String,
                 credits: doubleOptional(credits?["balance"]),
-                membershipExpiry: MembershipReader.expiry(),
                 resetCreditCount: intOptional(resetSummary?["availableCount"] ?? resetSummary?["available_count"]),
                 resetCreditExpiry: resetExpiry
             )
@@ -598,21 +610,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statsController: StatsWindowController?
     private var popover: NSPopover!
     private var popoverController: StatusPopoverController!
+    private var hasLoadedOnce = false
+    private var outsideClickMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.image = NSImage(systemSymbolName: "waveform.path.ecg", accessibilityDescription: "Codex Pulse")
         statusItem.button?.imagePosition = .imageLeading
-        statusItem.button?.title = " --"
+        statusItem.button?.title = " loading"
         popoverController = StatusPopoverController()
-        popoverController.onRefresh = { [weak self] in self?.refresh() }
-        popoverController.onOpenDashboard = { [weak self] in self?.showStats() }
+        popoverController.onRefresh = { [weak self] in self?.popover.performClose(nil); self?.refresh() }
+        popoverController.onOpenDashboard = { [weak self] in self?.popover.performClose(nil); self?.showStats() }
         popoverController.onQuit = { NSApp.terminate(nil) }
         popover = NSPopover()
         popover.behavior = .transient
         popover.animates = true
         popover.contentViewController = popoverController
+        outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            DispatchQueue.main.async { self?.popover.performClose(nil) }
+        }
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePopover)
         refresh()
@@ -623,13 +640,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if CommandLine.arguments.contains("--show-popover") {
             popover.behavior = .applicationDefined
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in self?.togglePopover() }
         }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        if let outsideClickMonitor { NSEvent.removeMonitor(outsideClickMonitor) }
     }
 
     @objc private func refresh() {
         guard !isRefreshing else { return }
         isRefreshing = true
+        statusItem.button?.title = " loading"
+        popoverController.setLoading()
         storeQueue.async { [weak self] in
             guard let self else { return }
             _ = self.store.importCodexHistory()
@@ -637,7 +659,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.async {
                     self.snapshot = snapshot ?? self.snapshot
                     self.isRefreshing = false
+                    self.hasLoadedOnce = true
                     self.updateUI()
+                    if CommandLine.arguments.contains("--show-popover"), !self.popover.isShown {
+                        self.togglePopover()
+                    }
                 }
             }
         }
@@ -662,7 +688,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func togglePopover() {
-        guard let button = statusItem.button else { return }
+        guard !isRefreshing, hasLoadedOnce, let button = statusItem.button else { return }
         if popover.isShown {
             popover.performClose(nil)
         } else {
@@ -674,11 +700,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateUI() {
         statsController?.update(records: store.records, apiCalls: store.apiCalls,
                                 activeAPICalls: store.activeAPICalls, sessionTitles: store.sessionTitles())
-        let totalModelCalls = store.records.reduce(0) { $0 + ($1.modelCalls ?? 0) }
-        popoverController.update(snapshot: snapshot, totalModelCalls: totalModelCalls,
-                                 taskCount: store.records.count, activeCallCount: store.activeAPICalls.count,
-                                 refreshedAt: Date())
-        if let used = snapshot?.secondaryUsed ?? snapshot?.primaryUsed { statusItem.button?.title = " \(max(0, 100 - used))%" }
+        let calendar = Calendar.current
+        let todayRecords = store.records.filter { record in
+            guard let date = requestMetricDate(record.timestamp) else { return false }
+            return calendar.isDateInToday(date)
+        }
+        let todayCalls = todayRecords.reduce(0) { $0 + ($1.modelCalls ?? 0) }
+        let todayTokens = todayRecords.reduce(0) { $0 + $1.usage.total }
+        popoverController.update(snapshot: snapshot, todayCalls: todayCalls, todayTokens: todayTokens,
+                                 todayCost: summedAPICost(todayRecords), refreshedAt: Date())
+        if let used = snapshot?.secondaryUsed ?? snapshot?.primaryUsed {
+            statusItem.button?.title = " \(max(0, 100 - used))%"
+        } else {
+            statusItem.button?.title = " --"
+        }
     }
 
     @objc private func openRecords() {
@@ -713,24 +748,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-private enum MembershipReader {
-    static func expiry() -> Date? {
-        let renewalDay = UserDefaults.standard.integer(forKey: "MembershipRenewalDay")
-        guard (1...31).contains(renewalDay) else { return nil }
-        let calendar = Calendar.current
-        let now = Date()
-        var components = calendar.dateComponents([.year, .month], from: now)
-        components.day = renewalDay
-        components.hour = 12
-        if let candidate = calendar.date(from: components), candidate > now { return candidate }
-        guard let nextMonth = calendar.date(byAdding: .month, value: 1, to: now) else { return nil }
-        components = calendar.dateComponents([.year, .month], from: nextMonth)
-        components.day = renewalDay
-        components.hour = 12
-        return calendar.date(from: components)
-    }
-}
-
 private let dateFormatter: DateFormatter = {
     let f = DateFormatter(); f.locale = Locale(identifier: "zh_CN"); f.dateFormat = "M月d日 HH:mm"; return f
 }()
@@ -738,6 +755,9 @@ private let dateFormatter: DateFormatter = {
 private let isoFormatter: ISO8601DateFormatter = {
     let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f
 }()
+
+private let plainISOFormatter = ISO8601DateFormatter()
+private func requestMetricDate(_ value: String) -> Date? { isoFormatter.date(from: value) ?? plainISOFormatter.date(from: value) }
 
 private func int(_ value: Any?) -> Int {
     if let value = value as? Int { return value }

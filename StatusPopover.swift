@@ -6,20 +6,18 @@ final class StatusPopoverController: NSViewController {
     var onQuit: (() -> Void)?
 
     private let ring = QuotaRingView()
-    private let planLabel = label("CODEX", size: 12, weight: .medium, color: .secondaryLabelColor)
+    private let planLabel = label("LOADING", size: 12, weight: .medium, color: .secondaryLabelColor)
     private let windowTitle = label("7 天窗口", size: 14, weight: .semibold)
     private let quotaDetail = label("正在读取额度…", size: 12, color: .secondaryLabelColor)
     private let resetLabel = label("", size: 12, color: .secondaryLabelColor)
     private let progress = QuotaProgressView()
     private let shortQuotaLabel = label("", size: 12, color: .secondaryLabelColor)
-    private let memberExpiryLabel = label("会员到期：--", size: 12)
-    private let creditsLabel = label("Credits：--", size: 12, color: .secondaryLabelColor)
     private let resetCard = CardView(tint: .systemOrange)
     private let resetCountLabel = label("0", size: 32, weight: .semibold)
     private let resetExpiryLabel = label("暂无可用重置卡", size: 12, color: .secondaryLabelColor)
     private let callsValue = label("--", size: 18, weight: .semibold)
-    private let tasksValue = label("--", size: 18, weight: .semibold)
-    private let activeValue = label("--", size: 18, weight: .semibold)
+    private let tokensValue = label("--", size: 18, weight: .semibold)
+    private let costValue = label("--", size: 18, weight: .semibold)
     private let updatedLabel = label("", size: 11, color: .tertiaryLabelColor)
 
     override func loadView() {
@@ -29,33 +27,45 @@ final class StatusPopoverController: NSViewController {
         root.state = .active
         root.translatesAutoresizingMaskIntoConstraints = false
         view = root
-        preferredContentSize = NSSize(width: 398, height: 510)
+        preferredContentSize = NSSize(width: 398, height: 390)
 
         let content = NSStackView()
         content.orientation = .vertical
         content.alignment = .leading
-        content.spacing = 14
+        content.spacing = 11
         content.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(content)
         NSLayoutConstraint.activate([
-            content.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 18),
-            content.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -18),
-            content.topAnchor.constraint(equalTo: root.topAnchor, constant: 16),
-            content.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -14)
+            content.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
+            content.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
+            content.topAnchor.constraint(equalTo: root.topAnchor, constant: 14),
+            content.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -12)
         ])
 
         content.addArrangedSubview(makeHeader())
         content.addArrangedSubview(makeQuotaCard())
-        content.addArrangedSubview(makeMembershipRow())
         content.addArrangedSubview(resetCard)
         setupResetCard()
         content.addArrangedSubview(makeStatsRow())
-        content.addArrangedSubview(makeBottomBar())
         for child in content.arrangedSubviews { child.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true }
     }
 
-    func update(snapshot: RateLimitReader.Snapshot?, totalModelCalls: Int, taskCount: Int,
-                activeCallCount: Int, refreshedAt: Date) {
+    func setLoading() {
+        ring.remaining = nil
+        planLabel.stringValue = "LOADING"
+        windowTitle.stringValue = "正在刷新"
+        quotaDetail.stringValue = "loading"
+        progress.usedPercent = nil
+        resetLabel.stringValue = ""
+        shortQuotaLabel.isHidden = true
+        callsValue.stringValue = "loading"
+        tokensValue.stringValue = "loading"
+        costValue.stringValue = "loading"
+        updatedLabel.stringValue = "刷新中…"
+    }
+
+    func update(snapshot: RateLimitReader.Snapshot?, todayCalls: Int, todayTokens: Int,
+                todayCost: Double?, refreshedAt: Date) {
         let mainUsed = snapshot?.secondaryUsed ?? snapshot?.primaryUsed
         let mainMinutes = snapshot?.secondaryUsed != nil ? snapshot?.secondaryMinutes : snapshot?.primaryMinutes
         let mainReset = snapshot?.secondaryUsed != nil ? snapshot?.secondaryReset : snapshot?.primaryReset
@@ -65,24 +75,25 @@ final class StatusPopoverController: NSViewController {
         quotaDetail.stringValue = mainUsed.map { "已用 \($0)%  ·  剩余 \(max(0, 100 - $0))%" } ?? "额度暂时无法读取"
         progress.usedPercent = mainUsed
         resetLabel.stringValue = mainReset.map { "重置于 \(fullDate($0))  ·  \(relativeTime($0))" } ?? "重置时间暂不可用"
-        planLabel.stringValue = (snapshot?.plan ?? "Codex").uppercased()
+        let plan = (snapshot?.plan ?? "--").uppercased()
+        let credits = snapshot?.credits.map { String(format: "%.2f", $0) } ?? "--"
+        planLabel.stringValue = "\(plan)  ·  Credits \(credits)"
 
         if snapshot?.secondaryUsed != nil, let used = snapshot?.primaryUsed {
+            shortQuotaLabel.isHidden = false
             shortQuotaLabel.stringValue = "\(windowName(snapshot?.primaryMinutes))：已用 \(used)% · 剩余 \(max(0, 100 - used))%" + (snapshot?.primaryReset.map { " · \(relativeTime($0))重置" } ?? "")
         } else {
-            shortQuotaLabel.stringValue = ""
+            shortQuotaLabel.isHidden = true
         }
-        memberExpiryLabel.stringValue = snapshot?.membershipExpiry.map { "下次续费：\(dateOnly($0))  ·  \(relativeTime($0))" } ?? "下次续费：未设置"
-        creditsLabel.stringValue = "Credits：" + (snapshot?.credits.map { String(format: "%.2f", $0) } ?? "--")
 
         let resetCount = snapshot?.resetCreditCount ?? 0
         resetCountLabel.stringValue = "\(resetCount)"
         resetExpiryLabel.stringValue = snapshot?.resetCreditExpiry.map { "最近到期  \(fullDate($0))" } ?? (resetCount > 0 ? "到期时间暂不可用" : "暂无可用重置卡")
         resetCard.isHidden = snapshot?.resetCreditCount == nil
 
-        callsValue.stringValue = compactNumber(totalModelCalls)
-        tasksValue.stringValue = compactNumber(taskCount)
-        activeValue.stringValue = "\(activeCallCount)"
+        callsValue.stringValue = compactNumber(todayCalls)
+        tokensValue.stringValue = compactNumber(todayTokens)
+        costValue.stringValue = formatUSD(todayCost)
         updatedLabel.stringValue = "更新于 " + timeOnly(refreshedAt)
     }
 
@@ -92,6 +103,8 @@ final class StatusPopoverController: NSViewController {
         NSLayoutConstraint.activate([icon.widthAnchor.constraint(equalToConstant: 28), icon.heightAnchor.constraint(equalToConstant: 28)])
         let title = label("Codex Pulse", size: 17, weight: .semibold)
         row.addArrangedSubview(icon); row.addArrangedSubview(title); row.addArrangedSubview(NSView()); row.addArrangedSubview(updatedLabel)
+        row.addArrangedSubview(iconButton("arrow.clockwise", toolTip: "立即刷新", action: #selector(refreshNow)))
+        row.addArrangedSubview(iconButton("chart.bar.xaxis", toolTip: "打开统计面板", action: #selector(openDashboard)))
         let quit = iconButton("power", toolTip: "退出 Codex Pulse", action: #selector(quitApp))
         row.addArrangedSubview(quit)
         return row
@@ -107,25 +120,21 @@ final class StatusPopoverController: NSViewController {
         ])
         let top = NSStackView(); top.orientation = .horizontal; top.alignment = .centerY; top.spacing = 12
         let names = NSStackView(); names.orientation = .vertical; names.alignment = .leading; names.spacing = 4
-        names.addArrangedSubview(label("Codex", size: 19, weight: .semibold)); names.addArrangedSubview(planLabel)
+        let member = NSStackView(); member.orientation = .horizontal; member.alignment = .centerY; member.spacing = 7
+        let crown = NSImageView(image: NSImage(systemSymbolName: "crown.fill", accessibilityDescription: "会员") ?? NSImage())
+        crown.contentTintColor = .systemYellow
+        member.addArrangedSubview(label("Codex", size: 19, weight: .semibold)); member.addArrangedSubview(crown)
+        names.addArrangedSubview(member); names.addArrangedSubview(planLabel)
         top.addArrangedSubview(names); top.addArrangedSubview(NSView()); top.addArrangedSubview(ring)
-        NSLayoutConstraint.activate([ring.widthAnchor.constraint(equalToConstant: 82), ring.heightAnchor.constraint(equalToConstant: 82)])
+        NSLayoutConstraint.activate([ring.widthAnchor.constraint(equalToConstant: 70), ring.heightAnchor.constraint(equalToConstant: 70)])
         vertical.addArrangedSubview(top); top.widthAnchor.constraint(equalTo: vertical.widthAnchor).isActive = true
         let titleRow = NSStackView(); titleRow.orientation = .horizontal; titleRow.addArrangedSubview(windowTitle); titleRow.addArrangedSubview(NSView()); titleRow.addArrangedSubview(quotaDetail)
         vertical.addArrangedSubview(titleRow); titleRow.widthAnchor.constraint(equalTo: vertical.widthAnchor).isActive = true
         vertical.addArrangedSubview(progress)
         NSLayoutConstraint.activate([progress.widthAnchor.constraint(equalTo: vertical.widthAnchor), progress.heightAnchor.constraint(equalToConstant: 8)])
         vertical.addArrangedSubview(resetLabel); vertical.addArrangedSubview(shortQuotaLabel)
-        card.heightAnchor.constraint(equalToConstant: 220).isActive = true
+        card.heightAnchor.constraint(equalToConstant: 185).isActive = true
         return card
-    }
-
-    private func makeMembershipRow() -> NSView {
-        let row = NSStackView(); row.orientation = .horizontal; row.alignment = .centerY; row.spacing = 8
-        let icon = NSImageView(image: NSImage(systemSymbolName: "person.crop.circle.badge.checkmark", accessibilityDescription: nil) ?? NSImage())
-        icon.contentTintColor = .systemBlue
-        row.addArrangedSubview(icon); row.addArrangedSubview(memberExpiryLabel); row.addArrangedSubview(NSView()); row.addArrangedSubview(creditsLabel)
-        return row
     }
 
     private func setupResetCard() {
@@ -143,15 +152,7 @@ final class StatusPopoverController: NSViewController {
 
     private func makeStatsRow() -> NSView {
         let row = NSStackView(); row.orientation = .horizontal; row.distribution = .fillEqually; row.spacing = 8
-        row.addArrangedSubview(stat("模型调用", callsValue)); row.addArrangedSubview(stat("任务", tasksValue)); row.addArrangedSubview(stat("进行中", activeValue))
-        return row
-    }
-
-    private func makeBottomBar() -> NSView {
-        let row = NSStackView(); row.orientation = .horizontal; row.alignment = .centerY; row.spacing = 10
-        let refresh = NSButton(title: "刷新", target: self, action: #selector(refreshNow)); refresh.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil); refresh.imagePosition = .imageLeading; refresh.bezelStyle = .rounded
-        let dashboard = NSButton(title: "打开统计面板", target: self, action: #selector(openDashboard)); dashboard.image = NSImage(systemSymbolName: "chart.bar.xaxis", accessibilityDescription: nil); dashboard.imagePosition = .imageLeading; dashboard.bezelStyle = .rounded; dashboard.keyEquivalent = "\r"
-        row.addArrangedSubview(refresh); row.addArrangedSubview(NSView()); row.addArrangedSubview(dashboard)
+        row.addArrangedSubview(stat("今日调用次数", callsValue)); row.addArrangedSubview(stat("今日 Token 总数", tokensValue)); row.addArrangedSubview(stat("今日等价花费", costValue))
         return row
     }
 
@@ -189,30 +190,19 @@ private final class QuotaProgressView: NSView {
 }
 
 private final class ResetCreditIconView: NSView {
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        let circle = NSBezierPath(ovalIn: bounds.insetBy(dx: 1, dy: 1))
-        NSColor.systemOrange.setFill()
-        circle.fill()
-
-        let center = NSPoint(x: bounds.midX, y: bounds.midY)
-        let arrow = NSBezierPath()
-        arrow.appendArc(withCenter: center, radius: 10.5, startAngle: 45, endAngle: 320, clockwise: true)
-        arrow.lineWidth = 3
-        arrow.lineCapStyle = .round
-        arrow.lineJoinStyle = .round
-        NSColor.white.setStroke()
-        arrow.stroke()
-
-        let head = NSBezierPath()
-        head.move(to: NSPoint(x: center.x - 10.2, y: center.y + 2.0))
-        head.line(to: NSPoint(x: center.x - 10.4, y: center.y + 10.0))
-        head.line(to: NSPoint(x: center.x - 3.0, y: center.y + 7.4))
-        head.lineWidth = 3
-        head.lineCapStyle = .round
-        head.lineJoinStyle = .round
-        head.stroke()
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.systemOrange.cgColor
+        layer?.cornerRadius = 19
+        let image = NSImageView(image: NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "重置") ?? NSImage())
+        image.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 21, weight: .semibold)
+        image.contentTintColor = .white
+        image.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(image)
+        NSLayoutConstraint.activate([image.centerXAnchor.constraint(equalTo: centerXAnchor), image.centerYAnchor.constraint(equalTo: centerYAnchor)])
     }
+    required init?(coder: NSCoder) { nil }
 }
 
 private final class CardView: NSView {
@@ -261,10 +251,6 @@ private func windowName(_ minutes: Int?) -> String {
 
 private func fullDate(_ date: Date) -> String {
     let f = DateFormatter(); f.locale = Locale(identifier: "zh_CN"); f.dateFormat = "yyyy年M月d日 HH:mm"; return f.string(from: date)
-}
-
-private func dateOnly(_ date: Date) -> String {
-    let f = DateFormatter(); f.locale = Locale(identifier: "zh_CN"); f.dateFormat = "yyyy年M月d日"; return f.string(from: date)
 }
 
 private func timeOnly(_ date: Date) -> String {
