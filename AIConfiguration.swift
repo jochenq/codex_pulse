@@ -1,6 +1,6 @@
 import AppKit
+import CryptoKit
 import Foundation
-import Security
 
 struct AIServiceConfiguration {
     var baseURL: String
@@ -18,15 +18,21 @@ final class AIConfigurationStore {
 
     private let baseURLKey = "tibo-ai-base-url"
     private let modelKey = "tibo-ai-model"
-    private let keychainService = "com.local.CodexPulse.Monitor.ai"
-    private let keychainAccount = "openai-compatible-api-key"
+    private let keyURL: URL
+    private let encryptedAPIKeyURL: URL
 
-    private init() {}
+    private init() {
+        let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("Codex Pulse", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        keyURL = directory.appendingPathComponent("ai-config.key")
+        encryptedAPIKeyURL = directory.appendingPathComponent("api-key.enc")
+    }
 
     func load() -> AIServiceConfiguration {
         AIServiceConfiguration(
             baseURL: UserDefaults.standard.string(forKey: baseURLKey) ?? "",
-            apiKey: readAPIKey(),
+            apiKey: readLocalAPIKey(),
             model: UserDefaults.standard.string(forKey: modelKey) ?? ""
         )
     }
@@ -35,7 +41,7 @@ final class AIConfigurationStore {
     func save(_ configuration: AIServiceConfiguration) -> Bool {
         let baseURL = normalizedBaseURL(configuration.baseURL)
         let model = configuration.model.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard writeAPIKey(configuration.apiKey) else { return false }
+        guard writeLocalAPIKey(configuration.apiKey) else { return false }
         UserDefaults.standard.set(baseURL, forKey: baseURLKey)
         UserDefaults.standard.set(model, forKey: modelKey)
         return true
@@ -47,33 +53,43 @@ final class AIConfigurationStore {
         return result
     }
 
-    private func readAPIKey() -> String {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: keychainAccount,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data else { return "" }
-        return String(data: data, encoding: .utf8) ?? ""
+    private func readLocalAPIKey() -> String {
+        guard let keyData = try? Data(contentsOf: keyURL), keyData.count == 32,
+              let encrypted = try? Data(contentsOf: encryptedAPIKeyURL),
+              let box = try? AES.GCM.SealedBox(combined: encrypted),
+              let opened = try? AES.GCM.open(box, using: SymmetricKey(data: keyData)) else { return "" }
+        return String(data: opened, encoding: .utf8) ?? ""
     }
 
-    private func writeAPIKey(_ rawValue: String) -> Bool {
+    private func writeLocalAPIKey(_ rawValue: String) -> Bool {
         let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let identity: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: keychainAccount
-        ]
-        SecItemDelete(identity as CFDictionary)
-        guard !value.isEmpty else { return true }
-        var item = identity
-        item[kSecValueData as String] = Data(value.utf8)
-        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        return SecItemAdd(item as CFDictionary, nil) == errSecSuccess
+        guard !value.isEmpty else {
+            try? FileManager.default.removeItem(at: encryptedAPIKeyURL)
+            return true
+        }
+        guard let keyData = encryptionKey(),
+              let sealed = try? AES.GCM.seal(Data(value.utf8), using: SymmetricKey(data: keyData)),
+              let combined = sealed.combined else { return false }
+        do {
+            try combined.write(to: encryptedAPIKeyURL, options: [.atomic])
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: encryptedAPIKeyURL.path)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func encryptionKey() -> Data? {
+        if let data = try? Data(contentsOf: keyURL), data.count == 32 { return data }
+        var generator = SystemRandomNumberGenerator()
+        let data = Data((0..<32).map { _ in UInt8.random(in: .min ... .max, using: &generator) })
+        do {
+            try data.write(to: keyURL, options: [.atomic])
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyURL.path)
+            return data
+        } catch {
+            return nil
+        }
     }
 }
 
@@ -190,7 +206,7 @@ final class AIConfigurationWindowController: NSWindowController, NSWindowDelegat
         let baseRow = fieldRow(title: "Base URL", control: baseURLField,
                                help: "填写服务根地址；仅填写域名时会自动补 /v1。")
         let keyRow = fieldRow(title: "API Key", control: apiKeyField,
-                              help: "保存在 macOS Keychain，不写入配置文件。")
+                              help: "AES 加密保存在本机，不访问 macOS 钥匙串。")
         let modelRow = fieldRow(title: "模型", control: modelCombo,
                                 help: "可自动拉取，也可直接输入供应商提供的模型 ID。")
 
@@ -302,7 +318,7 @@ final class AIConfigurationWindowController: NSWindowController, NSWindowDelegat
             showStatus("请填写模型 ID", error: true); return
         }
         guard store.save(configuration) else {
-            showStatus("API Key 无法写入 Keychain", error: true); return
+            showStatus("API Key 无法写入本地加密文件", error: true); return
         }
         showStatus("已保存", error: false)
         onSave?(store.load())

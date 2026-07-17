@@ -26,9 +26,9 @@ open "../Codex Pulse Monitor.app"
 
 浮窗底部还会显示 Tibo（`@thsottiaux`）的公开动态摘要。应用每 5 分钟静默检查一次实时公开镜像，并以 X 官方公开页和 Embed 时间线作为回退；帖子时间由状态 ID 校验，所有来源若都超过 14 天会明确显示“时间线已过期”，不会把旧帖当新闻。应用用帖子 ID、发布时间与正文生成内容指纹；只有内容指纹变化时才调用已配置的 AI 服务，未变化时仅更新检查时间。最近一次成功摘要缓存在 `~/Library/Application Support/Codex Pulse/tibo-activity.json`。
 
-点击“Tibo 动态”旁的设置按钮可配置任意 OpenAI Chat Completions 兼容服务，包括 Base URL、API Key 和模型。应用可通过兼容的 `GET /models` 接口自动拉取模型列表，也允许手动输入模型 ID。Base URL 与模型保存在本地偏好，API Key 保存在 macOS Keychain；应用不再读取 `DEEPSEEK_API_KEY` 或其他 AI 环境变量。
+点击“Tibo 动态”旁的设置按钮可配置任意 OpenAI Chat Completions 兼容服务，包括 Base URL、API Key 和模型。应用可通过兼容的 `GET /models` 接口自动拉取模型列表，也允许手动输入模型 ID。Base URL 与模型保存在本地偏好，API Key 以 AES 加密文件保存在应用支持目录，不访问 macOS 钥匙串；应用也不读取 `DEEPSEEK_API_KEY` 或其他 AI 环境变量。
 
-保存配置后会立即重新分析，无需重启 Codex Pulse。摘要使用所选模型生成简短的中文事实摘要；不会推测位置、作息或其他私人信息。
+保存配置后会立即重新分析，无需重启 Codex Pulse。顶部手动刷新会强制重新抓取并分析 Tibo 动态，不受内容指纹缓存影响。摘要使用所选模型生成简短的中文事实摘要，并根据公开动态粗略推测工作、休息等即时状态；只有公开内容提供地点证据时才显示推测地区与时区，否则默认使用旧金山湾区。
 
 Token 数字会自动使用 `K`、`M`、`B` 紧凑显示。点击菜单中的“统计面板…”（`⌘D`）可打开原生统计窗口，支持：
 

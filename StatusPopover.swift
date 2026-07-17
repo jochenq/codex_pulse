@@ -26,11 +26,14 @@ final class StatusPopoverController: NSViewController {
     private let updatedLabel = label("", size: 11, color: .tertiaryLabelColor)
     private let tiboHeadline = label("正在获取公开动态", size: 13, weight: .semibold)
     private let tiboSummary = label("首次分析完成后会显示在这里。", size: 11, color: .secondaryLabelColor)
+    private let tiboLocalTime = label("旧金山湾区 / PT", size: 10, weight: .medium, color: .secondaryLabelColor)
     private let tiboMeta = label("尚未检查", size: 10, color: .tertiaryLabelColor)
     private let tiboStatusDot = StatusDotView()
+    private let tiboAvatar = NSImageView(image: NSImage(systemSymbolName: "person.crop.circle.fill", accessibilityDescription: "Tibo 头像") ?? NSImage())
     private let tiboSectionTitle = label("Tibo 动态", size: 12, weight: .semibold, color: .systemBlue)
     private weak var refreshButton: RefreshIconButton?
     private var refreshing = false
+    private var loadedTiboAvatarURL: String?
 
     override func loadView() {
         let root = NSVisualEffectView()
@@ -39,7 +42,7 @@ final class StatusPopoverController: NSViewController {
         root.state = .active
         root.translatesAutoresizingMaskIntoConstraints = false
         view = root
-        preferredContentSize = NSSize(width: 398, height: 540)
+        preferredContentSize = NSSize(width: 398, height: 564)
 
         let content = NSStackView()
         content.orientation = .vertical
@@ -116,20 +119,26 @@ final class StatusPopoverController: NSViewController {
         tiboSectionTitle.stringValue = "Tibo " + (snapshot.activityState?.isEmpty == false ? snapshot.activityState! : "动态")
         tiboHeadline.stringValue = snapshot.headline
         tiboSummary.stringValue = snapshot.summary
+        tiboLocalTime.stringValue = tiboPlaceAndTime(snapshot)
+        loadTiboAvatar(snapshot.avatarURL)
         let checked = snapshot.checkedAt == .distantPast ? "尚未检查" : "检查于 \(timeOnly(snapshot.checkedAt))"
         let latest = snapshot.latestPostAt.map { " · 最近发帖 \(shortActivityDate($0))" } ?? ""
         switch snapshot.status {
         case "current":
             tiboStatusDot.color = NSColor(calibratedRed: 0.10, green: 0.82, blue: 0.38, alpha: 1)
+            tiboSectionTitle.textColor = .systemGreen
             tiboMeta.stringValue = checked + latest
         case "loading":
             tiboStatusDot.color = NSColor.systemBlue.withAlphaComponent(0.55)
+            tiboSectionTitle.textColor = .systemBlue
             tiboMeta.stringValue = "正在更新 Tibo 动态…"
         case "missing-configuration":
             tiboStatusDot.color = NSColor.systemOrange.withAlphaComponent(0.58)
+            tiboSectionTitle.textColor = .systemOrange
             tiboMeta.stringValue = "请配置 AI 服务 · " + checked
         default:
             tiboStatusDot.color = NSColor.systemOrange.withAlphaComponent(0.58)
+            tiboSectionTitle.textColor = .systemOrange
             tiboMeta.stringValue = "本次检查未完成，保留上次摘要 · " + checked
         }
     }
@@ -206,14 +215,20 @@ final class StatusPopoverController: NSViewController {
         let content = NSStackView(); content.orientation = .vertical; content.alignment = .leading; content.spacing = 5; content.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(content)
         NSLayoutConstraint.activate([
-            card.heightAnchor.constraint(equalToConstant: 116),
+            card.heightAnchor.constraint(equalToConstant: 140),
             content.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 13),
             content.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -13),
             content.topAnchor.constraint(equalTo: card.topAnchor, constant: 10),
             content.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -9)
         ])
         let header = NSStackView(); header.orientation = .horizontal; header.alignment = .centerY; header.spacing = 7
+        tiboAvatar.imageScaling = .scaleProportionallyUpOrDown
+        tiboAvatar.wantsLayer = true
+        tiboAvatar.layer?.cornerRadius = 11
+        tiboAvatar.layer?.masksToBounds = true
+        NSLayoutConstraint.activate([tiboAvatar.widthAnchor.constraint(equalToConstant: 22), tiboAvatar.heightAnchor.constraint(equalToConstant: 22)])
         NSLayoutConstraint.activate([tiboStatusDot.widthAnchor.constraint(equalToConstant: 7), tiboStatusDot.heightAnchor.constraint(equalToConstant: 7)])
+        header.addArrangedSubview(tiboAvatar)
         header.addArrangedSubview(tiboStatusDot)
         header.addArrangedSubview(tiboSectionTitle)
         let settings = iconButton("slider.horizontal.3", toolTip: "配置 Tibo AI", action: #selector(configureAI))
@@ -230,8 +245,23 @@ final class StatusPopoverController: NSViewController {
         tiboSummary.maximumNumberOfLines = 3
         tiboSummary.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         content.addArrangedSubview(tiboSummary); tiboSummary.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
+        content.addArrangedSubview(tiboLocalTime)
         content.addArrangedSubview(tiboMeta)
         return card
+    }
+
+    private func loadTiboAvatar(_ rawURL: String?) {
+        guard let rawURL, rawURL != loadedTiboAvatarURL, let url = URL(string: rawURL) else { return }
+        loadedTiboAvatarURL = rawURL
+        var request = URLRequest(url: url, cachePolicy: .returnCacheDataElseLoad, timeoutInterval: 20)
+        request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+            guard let data, let image = NSImage(data: data) else { return }
+            DispatchQueue.main.async {
+                guard self?.loadedTiboAvatarURL == rawURL else { return }
+                self?.tiboAvatar.image = image
+            }
+        }.resume()
     }
 
     private func stat(_ title: String, _ value: NSTextField) -> NSView {
@@ -452,6 +482,19 @@ private func shortActivityDate(_ date: Date) -> String {
     formatter.locale = Locale(identifier: "zh_CN")
     formatter.dateFormat = "M月d日"
     return formatter.string(from: date)
+}
+
+private func tiboPlaceAndTime(_ snapshot: TiboActivitySnapshot) -> String {
+    let identifier = snapshot.timeZoneIdentifier ?? "America/Los_Angeles"
+    let timeZone = TimeZone(identifier: identifier) ?? TimeZone(identifier: "America/Los_Angeles")!
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "zh_CN")
+    formatter.timeZone = timeZone
+    formatter.dateFormat = "HH:mm EEE"
+    let location = snapshot.inferredLocation?.isEmpty == false ? snapshot.inferredLocation! : "旧金山湾区"
+    let abbreviation = timeZone.abbreviation(for: Date()) ?? identifier
+    let source = snapshot.locationIsInferred == true ? "动态推测" : "默认时区"
+    return "\(location) / \(abbreviation) · \(formatter.string(from: Date())) · \(source)"
 }
 
 private func windowName(_ minutes: Int?) -> String {

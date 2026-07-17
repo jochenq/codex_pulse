@@ -11,12 +11,17 @@ struct TiboActivitySnapshot: Codable {
     var sourceURL: String
     var status: String
     var activityState: String?
+    var inferredLocation: String?
+    var timeZoneIdentifier: String?
+    var locationIsInferred: Bool?
+    var avatarURL: String?
 
     static func empty() -> TiboActivitySnapshot {
         TiboActivitySnapshot(
             fingerprint: "", headline: "正在获取公开动态", summary: "首次分析完成后会显示在这里。",
             latestPostAt: nil, analyzedAt: nil, checkedAt: .distantPast,
-            sourceURL: "https://x.com/thsottiaux", status: "loading", activityState: nil
+            sourceURL: "https://x.com/thsottiaux", status: "loading", activityState: nil,
+            inferredLocation: nil, timeZoneIdentifier: nil, locationIsInferred: nil, avatarURL: nil
         )
     }
 }
@@ -26,12 +31,16 @@ private struct TiboPost {
     let text: String
     let publishedAt: Date
     let url: String
+    let avatarURL: String?
 }
 
 private struct AIActivityDigest: Decodable {
     let state: String
     let headline: String
     let summary: String
+    let location: String?
+    let timeZone: String?
+    let locationMode: String?
 }
 
 final class TiboMonitor {
@@ -143,13 +152,15 @@ final class TiboMonitor {
         let matches = regex.matches(in: html, range: NSRange(location: 0, length: nsHTML.length))
         var seen = Set<String>()
         var posts: [TiboPost] = []
+        let avatarURL = firstTiboAvatarURL(in: html)
         for match in matches {
             let id = nsHTML.substring(with: match.range(at: 1))
             guard seen.insert(id).inserted, let date = dateFromSnowflake(id) else { continue }
             let body = nsHTML.substring(with: match.range(at: 2))
             let text = stripHTML(body).trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { continue }
-            posts.append(TiboPost(id: id, text: text, publishedAt: date, url: "https://x.com/thsottiaux/status/\(id)"))
+            posts.append(TiboPost(id: id, text: text, publishedAt: date,
+                                  url: "https://x.com/thsottiaux/status/\(id)", avatarURL: avatarURL))
         }
         let sorted = posts.sorted { $0.publishedAt > $1.publishedAt }
         let substantive = sorted.filter { !$0.text.hasPrefix("@") }
@@ -185,7 +196,10 @@ final class TiboMonitor {
                   let date = formatter.date(from: created) else { continue }
             let text = decodeHTMLEntities(rawText).trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { continue }
-            posts.append(TiboPost(id: id, text: text, publishedAt: date, url: "https://x.com/thsottiaux/status/\(id)"))
+            let user = tweet["user"] as? [String: Any]
+            let avatarURL = user?["profile_image_url_https"] as? String ?? firstTiboAvatarURL(in: html)
+            posts.append(TiboPost(id: id, text: text, publishedAt: date,
+                                  url: "https://x.com/thsottiaux/status/\(id)", avatarURL: avatarURL))
         }
         return posts.sorted { $0.publishedAt > $1.publishedAt }.prefix(12).map { $0 }
     }
@@ -221,7 +235,8 @@ final class TiboMonitor {
             guard let text = metadata["articleBody"]?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty,
                   let dateText = metadata["datePublished"], let date = iso.date(from: dateText) else { continue }
             let canonicalURL = "https://x.com/thsottiaux/status/\(id)"
-            posts.append(TiboPost(id: id, text: text, publishedAt: date, url: canonicalURL))
+            posts.append(TiboPost(id: id, text: text, publishedAt: date,
+                                  url: canonicalURL, avatarURL: firstTiboAvatarURL(in: html)))
         }
         return posts.sorted { $0.publishedAt > $1.publishedAt }.prefix(8).map { $0 }
     }
@@ -249,6 +264,10 @@ final class TiboMonitor {
             self.queue.async {
                 switch result {
                 case .success(let digest):
+                    let proposedTimeZone = digest.timeZone.flatMap(TimeZone.init(identifier:))
+                    let hasLocationEvidence = digest.locationMode == "inferred"
+                        && proposedTimeZone != nil
+                        && digest.location?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
                     self.snapshot = TiboActivitySnapshot(
                         fingerprint: fingerprint,
                         headline: limitedText(digest.headline, maximum: 14),
@@ -257,7 +276,11 @@ final class TiboMonitor {
                         analyzedAt: Date(), checkedAt: Date(),
                         sourceURL: posts.first?.url ?? self.profileURL.absoluteString,
                         status: "current",
-                        activityState: limitedText(digest.state, maximum: 5)
+                        activityState: limitedText(digest.state, maximum: 5),
+                        inferredLocation: hasLocationEvidence ? limitedText(digest.location!, maximum: 12) : "旧金山湾区",
+                        timeZoneIdentifier: hasLocationEvidence ? proposedTimeZone!.identifier : "America/Los_Angeles",
+                        locationIsInferred: hasLocationEvidence,
+                        avatarURL: posts.compactMap(\.avatarURL).first ?? self.snapshot.avatarURL
                     )
                 case .failure:
                     self.snapshot.checkedAt = Date()
@@ -280,14 +303,15 @@ final class TiboMonitor {
         1. 首要寻找 Codex 用量额度、rate limit、reset、重置窗口、reset card、reset credit、订阅用量恢复等信息。只要存在，就必须放在标题和摘要首句，并写清帖子日期；不得把旧消息说成刚发生。
         2. 如果没有发现这类信息，标题直接说明“暂无新的 Reset 消息”，不要自行猜测。
         3. 其他 Codex 产品、模型或团队动态最多用一句话简要概括。
-        根据最近几条帖子推断一个不超过5个汉字的即时状态，例如“要重置”“在修Bug”“忙发布”“看反馈”；这是对公开工作动态的轻量判断，不得推断位置、作息或私人生活。
-        不使用营销腔；不得在结果中出现“帖子1”“帖子7”之类的内部编号。只输出 JSON，不要 Markdown：{"state":"不超过5个汉字","headline":"不超过14个汉字","summary":"1到2句，不超过66个汉字"}。输出前自行检查长度，超出必须压缩。
+        4. 根据正文、发帖时间与当前时间，粗略推测一个即时状态。state 优先从“工作、开会、发帖、吃饭、休息、睡觉、休假、出行、离线”中选择，不得把 Reset 结论当作人物状态。
+        5. 只有帖子明确透露所在地、行程或当地活动时，才推测粗粒度城市/地区及对应 IANA 时区，并令 locationMode 为 inferred；证据不足时必须输出 location="旧金山湾区"、timeZone="America/Los_Angeles"、locationMode="fallback"。不要推断精确地址。
+        不使用营销腔；不得在结果中出现“帖子1”“帖子7”之类的内部编号。只输出 JSON，不要 Markdown：{"state":"不超过5个汉字","headline":"不超过14个汉字","summary":"1到2句，不超过66个汉字","location":"城市或地区","timeZone":"IANA时区","locationMode":"inferred或fallback"}。输出前自行检查长度，超出必须压缩。
         """
         let body: [String: Any] = [
             "model": configuration.model,
             "messages": [
                 ["role": "system", "content": system],
-                ["role": "user", "content": "以下按发布时间从新到旧排列：\n\n\(source)"]
+                ["role": "user", "content": "当前 UTC 时间：\(formatter.string(from: Date()))\n以下按发布时间从新到旧排列：\n\n\(source)"]
             ],
             "temperature": 0.2,
             // Reasoning-capable compatible models count hidden reasoning toward this limit.
@@ -342,6 +366,14 @@ final class TiboMonitor {
 
 private enum MonitorError: Error {
     case invalidResponse, noPosts, staleTimeline, invalidRequest, analysisFailed
+}
+
+private func firstTiboAvatarURL(in text: String) -> String? {
+    guard let regex = try? NSRegularExpression(
+        pattern: #"https://pbs\.twimg\.com/profile_images/[A-Za-z0-9_./-]+"#
+    ), let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+       let range = Range(match.range, in: text) else { return nil }
+    return String(text[range]).replacingOccurrences(of: "_normal.", with: ".")
 }
 
 private func decodeHTMLEntities(_ text: String) -> String {

@@ -624,12 +624,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        installEditMenu()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.image = NSImage(systemSymbolName: "waveform.path.ecg", accessibilityDescription: "Codex Pulse")
         statusItem.button?.imagePosition = .imageLeading
         statusItem.button?.title = " loading"
         popoverController = StatusPopoverController()
-        popoverController.onRefresh = { [weak self] in self?.refresh() }
+        popoverController.onRefresh = { [weak self] in self?.manualRefresh() }
         popoverController.onOpenDashboard = { [weak self] in self?.popover.performClose(nil); self?.showStats() }
         popoverController.onOpenTibo = { NSWorkspace.shared.open(URL(string: "https://x.com/thsottiaux")!) }
         popoverController.onConfigureAI = { [weak self] in self?.showAIConfiguration() }
@@ -683,6 +684,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         aiConfigurationController?.show()
+    }
+
+    private func manualRefresh() {
+        refreshTibo(forceAnalysis: true)
+        refresh()
+    }
+
+    private func installEditMenu() {
+        let mainMenu = NSMenu()
+        let editItem = NSMenuItem()
+        let editMenu = NSMenu(title: "编辑")
+        editItem.submenu = editMenu
+        mainMenu.addItem(editItem)
+        for (title, action, key) in [
+            ("剪切", "cut:", "x"), ("复制", "copy:", "c"), ("粘贴", "paste:", "v"),
+            ("全选", "selectAll:", "a")
+        ] {
+            editMenu.addItem(withTitle: title, action: Selector(action), keyEquivalent: key)
+        }
+        NSApp.mainMenu = mainMenu
     }
 
     @objc private func refresh() {
