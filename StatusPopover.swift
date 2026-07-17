@@ -22,7 +22,7 @@ final class StatusPopoverController: NSViewController {
     private let tokensValue = label("--", size: 18, weight: .semibold)
     private let costValue = label("--", size: 18, weight: .semibold)
     private let updatedLabel = label("", size: 11, color: .tertiaryLabelColor)
-    private weak var refreshButton: NSButton?
+    private weak var refreshButton: RefreshIconButton?
     private var refreshing = false
 
     override func loadView() {
@@ -110,10 +110,10 @@ final class StatusPopoverController: NSViewController {
         NSLayoutConstraint.activate([icon.widthAnchor.constraint(equalToConstant: 28), icon.heightAnchor.constraint(equalToConstant: 28)])
         let title = label("Codex Pulse", size: 17, weight: .semibold)
         row.addArrangedSubview(icon); row.addArrangedSubview(title); row.addArrangedSubview(NSView()); row.addArrangedSubview(updatedLabel)
-        let refresh = iconButton("arrow.triangle.2.circlepath.circle", toolTip: "立即刷新", action: #selector(refreshNow))
+        let refresh = RefreshIconButton(target: self, action: #selector(refreshNow))
         refreshButton = refresh
         row.addArrangedSubview(refresh)
-        if refreshing { startRefreshAnimation(on: refresh) }
+        refresh.setSpinning(refreshing)
         row.addArrangedSubview(iconButton("chart.bar.xaxis", toolTip: "打开统计面板", action: #selector(openDashboard)))
         let quit = iconButton("power", toolTip: "退出 Codex Pulse", action: #selector(quitApp))
         row.addArrangedSubview(quit)
@@ -183,32 +183,68 @@ final class StatusPopoverController: NSViewController {
 
     func setRefreshing(_ value: Bool) {
         refreshing = value
-        guard let button = refreshButton else { return }
-        if value {
-            startRefreshAnimation(on: button)
-        } else {
-            button.layer?.removeAnimation(forKey: "codex-pulse-refresh-spin")
-            button.layer?.setAffineTransform(.identity)
-            button.contentTintColor = .secondaryLabelColor
-        }
-    }
-
-    private func startRefreshAnimation(on button: NSButton) {
-        guard button.layer?.animation(forKey: "codex-pulse-refresh-spin") == nil else { return }
-        button.wantsLayer = true
-        button.contentTintColor = .systemBlue
-        let spin = CABasicAnimation(keyPath: "transform.rotation.z")
-        spin.fromValue = 0
-        spin.toValue = CGFloat.pi * 2
-        spin.duration = 0.75
-        spin.repeatCount = .infinity
-        spin.timingFunction = CAMediaTimingFunction(name: .linear)
-        button.layer?.add(spin, forKey: "codex-pulse-refresh-spin")
+        refreshButton?.setSpinning(value)
     }
 
     @objc private func refreshNow() { onRefresh?() }
     @objc private func openDashboard() { onOpenDashboard?() }
     @objc private func quitApp() { onQuit?() }
+}
+
+private final class RefreshIconButton: NSButton {
+    private let glyph = NSImageView()
+
+    init(target: AnyObject?, action: Selector?) {
+        super.init(frame: .zero)
+        self.target = target
+        self.action = action
+        title = ""
+        isBordered = false
+        toolTip = "立即刷新"
+        translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: 24),
+            heightAnchor.constraint(equalToConstant: 24)
+        ])
+
+        glyph.image = NSImage(systemSymbolName: "arrow.triangle.2.circlepath.circle", accessibilityDescription: "立即刷新")
+        glyph.imageScaling = .scaleProportionallyDown
+        glyph.contentTintColor = .secondaryLabelColor
+        glyph.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(glyph)
+        NSLayoutConstraint.activate([
+            glyph.centerXAnchor.constraint(equalTo: centerXAnchor),
+            glyph.centerYAnchor.constraint(equalTo: centerYAnchor),
+            glyph.widthAnchor.constraint(equalToConstant: 17),
+            glyph.heightAnchor.constraint(equalToConstant: 17)
+        ])
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        bounds.contains(point) ? self : nil
+    }
+
+    func setSpinning(_ spinning: Bool) {
+        layoutSubtreeIfNeeded()
+        glyph.wantsLayer = true
+        if spinning {
+            guard glyph.layer?.animation(forKey: "codex-pulse-refresh-spin") == nil else { return }
+            glyph.contentTintColor = .systemBlue
+            let spin = CABasicAnimation(keyPath: "transform.rotation.z")
+            spin.fromValue = 0
+            spin.toValue = CGFloat.pi * 2
+            spin.duration = 0.75
+            spin.repeatCount = .infinity
+            spin.timingFunction = CAMediaTimingFunction(name: .linear)
+            glyph.layer?.add(spin, forKey: "codex-pulse-refresh-spin")
+        } else {
+            glyph.layer?.removeAnimation(forKey: "codex-pulse-refresh-spin")
+            glyph.layer?.setAffineTransform(.identity)
+            glyph.contentTintColor = .secondaryLabelColor
+        }
+    }
 }
 
 private final class QuotaProgressView: NSView {
