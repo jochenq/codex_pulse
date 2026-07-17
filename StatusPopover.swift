@@ -244,7 +244,11 @@ final class StatusPopoverController: NSViewController {
         refresh.contentTintColor = .secondaryLabelColor
         header.addArrangedSubview(refresh)
         header.addArrangedSubview(NSView())
-        let source = NSButton(title: "查看 X ↗", target: self, action: #selector(openTibo))
+        let source = NSButton(title: "查看", target: self, action: #selector(openTibo))
+        source.image = xBrandIcon()
+        source.imagePosition = .imageRight
+        source.imageHugsTitle = true
+        source.toolTip = "在 X 中查看"
         source.isBordered = false; source.font = .systemFont(ofSize: 10, weight: .medium); source.contentTintColor = .secondaryLabelColor
         header.addArrangedSubview(source)
         content.addArrangedSubview(header); header.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
@@ -484,6 +488,20 @@ private final class QuotaRingView: NSView {
 
 private func label(_ text: String, size: CGFloat, weight: NSFont.Weight = .regular, color: NSColor = .labelColor) -> NSTextField {
     let field = NSTextField(labelWithString: text); field.font = .systemFont(ofSize: size, weight: weight); field.textColor = color; field.lineBreakMode = .byTruncatingTail; return field
+}
+
+private func xBrandIcon() -> NSImage {
+    let image = NSImage(size: NSSize(width: 12, height: 12))
+    image.lockFocus()
+    let text = NSAttributedString(string: "𝕏", attributes: [
+        .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+        .foregroundColor: NSColor.black
+    ])
+    let size = text.size()
+    text.draw(at: NSPoint(x: (12 - size.width) / 2, y: (12 - size.height) / 2))
+    image.unlockFocus()
+    image.isTemplate = true
+    return image
 }
 
 private func shortActivityDate(_ date: Date) -> String {
