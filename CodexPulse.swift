@@ -664,6 +664,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func refreshTibo(forceAnalysis: Bool = false) {
+        if forceAnalysis {
+            tiboSnapshot.status = "loading"
+            popoverController.updateTibo(tiboSnapshot)
+        }
         tiboMonitor.check(forceAnalysis: forceAnalysis) { [weak self] snapshot in
             guard let self else { return }
             self.tiboSnapshot = snapshot

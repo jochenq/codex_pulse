@@ -124,7 +124,7 @@ final class StatusPopoverController: NSViewController {
             tiboMeta.stringValue = checked + latest
         case "loading":
             tiboStatusDot.color = NSColor.systemBlue.withAlphaComponent(0.55)
-            tiboMeta.stringValue = "正在读取公开动态…"
+            tiboMeta.stringValue = "正在更新 Tibo 动态…"
         case "missing-configuration":
             tiboStatusDot.color = NSColor.systemOrange.withAlphaComponent(0.58)
             tiboMeta.stringValue = "请配置 AI 服务 · " + checked
