@@ -532,7 +532,7 @@ final class RateLimitReader {
                         "clientInfo": [
                             "name": "codex_pulse_monitor",
                             "title": "Codex Pulse Monitor",
-                            "version": "2.10.2"
+                            "version": "2.10.3"
                         ]
                     ]
                 ],

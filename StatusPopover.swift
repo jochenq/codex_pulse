@@ -110,7 +110,7 @@ final class StatusPopoverController: NSViewController {
         NSLayoutConstraint.activate([icon.widthAnchor.constraint(equalToConstant: 28), icon.heightAnchor.constraint(equalToConstant: 28)])
         let title = label("Codex Pulse", size: 17, weight: .semibold)
         row.addArrangedSubview(icon); row.addArrangedSubview(title); row.addArrangedSubview(NSView()); row.addArrangedSubview(updatedLabel)
-        let refresh = iconButton("arrow.clockwise", toolTip: "立即刷新", action: #selector(refreshNow))
+        let refresh = iconButton("arrow.triangle.2.circlepath.circle", toolTip: "立即刷新", action: #selector(refreshNow))
         refreshButton = refresh
         row.addArrangedSubview(refresh)
         if refreshing { startRefreshAnimation(on: refresh) }
