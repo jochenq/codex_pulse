@@ -37,7 +37,7 @@ final class StatusPopoverController: NSViewController {
         root.state = .active
         root.translatesAutoresizingMaskIntoConstraints = false
         view = root
-        preferredContentSize = NSSize(width: 398, height: 516)
+        preferredContentSize = NSSize(width: 398, height: 540)
 
         let content = NSStackView()
         content.orientation = .vertical
@@ -117,16 +117,16 @@ final class StatusPopoverController: NSViewController {
         let latest = snapshot.latestPostAt.map { " · 最近发帖 \(shortActivityDate($0))" } ?? ""
         switch snapshot.status {
         case "current":
-            tiboStatusDot.color = .systemGreen
+            tiboStatusDot.color = NSColor(calibratedRed: 0.38, green: 0.47, blue: 0.50, alpha: 0.72)
             tiboMeta.stringValue = checked + latest
         case "loading":
-            tiboStatusDot.color = .systemBlue
+            tiboStatusDot.color = NSColor.systemBlue.withAlphaComponent(0.55)
             tiboMeta.stringValue = "正在读取公开动态…"
         case "missing-key":
-            tiboStatusDot.color = .systemOrange
+            tiboStatusDot.color = NSColor.systemOrange.withAlphaComponent(0.58)
             tiboMeta.stringValue = "DeepSeek 环境变量未配置 · " + checked
         default:
-            tiboStatusDot.color = .systemOrange
+            tiboStatusDot.color = NSColor.systemOrange.withAlphaComponent(0.58)
             tiboMeta.stringValue = "本次检查未完成，保留上次摘要 · " + checked
         }
     }
@@ -203,16 +203,16 @@ final class StatusPopoverController: NSViewController {
         let content = NSStackView(); content.orientation = .vertical; content.alignment = .leading; content.spacing = 5; content.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(content)
         NSLayoutConstraint.activate([
-            card.heightAnchor.constraint(equalToConstant: 92),
+            card.heightAnchor.constraint(equalToConstant: 116),
             content.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 13),
             content.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -13),
             content.topAnchor.constraint(equalTo: card.topAnchor, constant: 10),
             content.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -9)
         ])
         let header = NSStackView(); header.orientation = .horizontal; header.alignment = .centerY; header.spacing = 7
-        NSLayoutConstraint.activate([tiboStatusDot.widthAnchor.constraint(equalToConstant: 7), tiboStatusDot.heightAnchor.constraint(equalToConstant: 7)])
+        NSLayoutConstraint.activate([tiboStatusDot.widthAnchor.constraint(equalToConstant: 6), tiboStatusDot.heightAnchor.constraint(equalToConstant: 6)])
         header.addArrangedSubview(tiboStatusDot)
-        header.addArrangedSubview(label("Tibo 动态", size: 12, weight: .semibold, color: .systemBlue))
+        header.addArrangedSubview(label("Tibo在干啥", size: 12, weight: .semibold, color: .systemBlue))
         header.addArrangedSubview(NSView())
         let source = NSButton(title: "查看原帖 ↗", target: self, action: #selector(openTibo))
         source.isBordered = false; source.font = .systemFont(ofSize: 10, weight: .medium); source.contentTintColor = .secondaryLabelColor
@@ -220,7 +220,7 @@ final class StatusPopoverController: NSViewController {
         content.addArrangedSubview(header); header.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
         content.addArrangedSubview(tiboHeadline)
         tiboSummary.lineBreakMode = .byWordWrapping
-        tiboSummary.maximumNumberOfLines = 2
+        tiboSummary.maximumNumberOfLines = 3
         tiboSummary.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         content.addArrangedSubview(tiboSummary); tiboSummary.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
         content.addArrangedSubview(tiboMeta)
@@ -249,7 +249,7 @@ final class StatusPopoverController: NSViewController {
 }
 
 private final class StatusDotView: NSView {
-    var color: NSColor = .systemBlue { didSet { needsDisplay = true } }
+    var color: NSColor = NSColor(calibratedRed: 0.38, green: 0.47, blue: 0.50, alpha: 0.72) { didSet { needsDisplay = true } }
     override func draw(_ dirtyRect: NSRect) {
         color.setFill()
         NSBezierPath(ovalIn: bounds).fill()

@@ -127,7 +127,7 @@ final class TiboMonitor {
     }
 
     private func handle(posts: [TiboPost], completion: @escaping (TiboActivitySnapshot) -> Void) {
-        let canonical = posts.map { "\($0.id)|\(Int($0.publishedAt.timeIntervalSince1970))|\($0.text)" }.joined(separator: "\n")
+        let canonical = "tibo-reset-radar-v2\n" + posts.map { "\($0.id)|\(Int($0.publishedAt.timeIntervalSince1970))|\($0.text)" }.joined(separator: "\n")
         let fingerprint = SHA256.hash(data: Data(canonical.utf8)).map { String(format: "%02x", $0) }.joined()
         if fingerprint == snapshot.fingerprint, snapshot.analyzedAt != nil {
             snapshot.checkedAt = Date()
@@ -149,8 +149,8 @@ final class TiboMonitor {
                 case .success(let digest):
                     self.snapshot = TiboActivitySnapshot(
                         fingerprint: fingerprint,
-                        headline: digest.headline.trimmingCharacters(in: .whitespacesAndNewlines),
-                        summary: digest.summary.trimmingCharacters(in: .whitespacesAndNewlines),
+                        headline: limitedText(digest.headline, maximum: 14),
+                        summary: limitedText(digest.summary, maximum: 66),
                         latestPostAt: posts.first?.publishedAt,
                         analyzedAt: Date(), checkedAt: Date(),
                         sourceURL: posts.first?.url ?? self.profileURL.absoluteString,
@@ -172,7 +172,11 @@ final class TiboMonitor {
             "[\(index + 1)] \(formatter.string(from: post.publishedAt))\n\(post.text)\n\(post.url)"
         }.joined(separator: "\n\n")
         let system = """
-        你是一个事实严谨的公开动态摘要助手。只根据给出的帖子总结 Tibo 最近在关注或推进什么，不推测位置、睡眠、私人生活或未公开信息。使用简体中文，信息密度高，不要营销腔。只输出 JSON：{"headline":"不超过18字的标题","summary":"2到3句、总计不超过100字的摘要"}。
+        你是“Codex 重置之神 Tibo”的公开动态观察员。只根据给出的帖子工作，并遵循以下优先级：
+        1. 首要寻找 Codex 用量额度、rate limit、reset、重置窗口、reset card、reset credit、订阅用量恢复等信息。只要存在，就必须放在标题和摘要首句，并写清帖子日期；不得把旧消息说成刚发生。
+        2. 如果没有发现这类信息，标题直接说明“暂无新的 Reset 消息”，不要自行猜测。
+        3. 其他 Codex 产品、模型或团队动态最多用一句话简要概括。
+        不推测位置、作息、私人生活或未公开信息，不使用营销腔。只输出 JSON，不要 Markdown：{"headline":"不超过14个汉字","summary":"1到2句，不超过66个汉字"}。输出前自行检查长度，超出必须压缩。
         """
         let body: [String: Any] = [
             "model": "deepseek-v4-flash",
@@ -183,7 +187,7 @@ final class TiboMonitor {
             "thinking": ["type": "disabled"],
             "response_format": ["type": "json_object"],
             "temperature": 0.2,
-            "max_tokens": 260,
+            "max_tokens": 180,
             "stream": false
         ]
         guard let json = try? JSONSerialization.data(withJSONObject: body) else {
@@ -244,4 +248,13 @@ private func decodeHTMLEntities(_ text: String) -> String {
         if let number, let scalar = UnicodeScalar(number) { decoded.replaceSubrange(whole, with: String(scalar)) }
     }
     return decoded
+}
+
+private func limitedText(_ text: String, maximum: Int) -> String {
+    let normalized = text
+        .replacingOccurrences(of: "\n", with: " ")
+        .split(whereSeparator: { $0.isWhitespace })
+        .joined(separator: " ")
+    guard normalized.count > maximum else { return normalized }
+    return String(normalized.prefix(maximum - 1)) + "…"
 }
