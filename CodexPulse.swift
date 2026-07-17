@@ -501,6 +501,9 @@ final class RateLimitReader {
         var secondaryReset: Date?
         var plan: String?
         var credits: Double?
+        var membershipExpiry: Date?
+        var resetCreditCount: Int?
+        var resetCreditExpiry: Date?
     }
 
     func read(completion: @escaping (Snapshot?) -> Void) {
@@ -530,7 +533,7 @@ final class RateLimitReader {
                         "clientInfo": [
                             "name": "codex_pulse_monitor",
                             "title": "Codex Pulse Monitor",
-                            "version": "2.8.0"
+                            "version": "2.9.0"
                         ]
                     ]
                 ],
@@ -561,6 +564,9 @@ final class RateLimitReader {
             let primary = limits["primary"] as? [String: Any]
             let secondary = limits["secondary"] as? [String: Any]
             let credits = limits["credits"] as? [String: Any]
+            let resetSummary = result["rateLimitResetCredits"] as? [String: Any]
+            let resetCredits = resetSummary?["credits"] as? [[String: Any]]
+            let resetExpiry = resetCredits?.compactMap { dateValue($0["expiresAt"] ?? $0["expires_at"]) }.min()
             return Snapshot(
                 primaryUsed: intOptional(primary?["usedPercent"] ?? primary?["used_percent"]),
                 primaryMinutes: intOptional(primary?["windowDurationMins"] ?? primary?["window_duration_mins"]),
@@ -569,7 +575,10 @@ final class RateLimitReader {
                 secondaryMinutes: intOptional(secondary?["windowDurationMins"] ?? secondary?["window_duration_mins"]),
                 secondaryReset: dateValue(secondary?["resetsAt"] ?? secondary?["resets_at"]),
                 plan: (limits["planType"] ?? limits["plan_type"]) as? String,
-                credits: doubleOptional(credits?["balance"])
+                credits: doubleOptional(credits?["balance"]),
+                membershipExpiry: MembershipReader.expiry(),
+                resetCreditCount: intOptional(resetSummary?["availableCount"] ?? resetSummary?["available_count"]),
+                resetCreditExpiry: resetExpiry
             )
         }
         return nil
@@ -587,6 +596,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isLivePolling = false
     private let storeQueue = DispatchQueue(label: "com.codexpulse.metric-store", qos: .utility)
     private var statsController: StatsWindowController?
+    private var popover: NSPopover!
+    private var popoverController: StatusPopoverController!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -594,11 +605,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.image = NSImage(systemSymbolName: "waveform.path.ecg", accessibilityDescription: "Codex Pulse")
         statusItem.button?.imagePosition = .imageLeading
         statusItem.button?.title = " --"
+        popoverController = StatusPopoverController()
+        popoverController.onRefresh = { [weak self] in self?.refresh() }
+        popoverController.onOpenDashboard = { [weak self] in self?.showStats() }
+        popoverController.onOpenRecords = { [weak self] in self?.openRecords() }
+        popoverController.onQuit = { NSApp.terminate(nil) }
+        popover = NSPopover()
+        popover.behavior = .transient
+        popover.animates = true
+        popover.contentViewController = popoverController
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(togglePopover)
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.refresh() }
         liveTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.pollLiveMetrics() }
         if CommandLine.arguments.contains("--show-stats") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.showStats() }
+        }
+        if CommandLine.arguments.contains("--show-popover") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in self?.togglePopover() }
         }
     }
 
@@ -612,7 +637,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.async {
                     self.snapshot = snapshot ?? self.snapshot
                     self.isRefreshing = false
-                    self.rebuildMenu()
+                    self.updateUI()
                 }
             }
         }
@@ -636,62 +661,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func rebuildMenu() {
+    @objc private func togglePopover() {
+        guard let button = statusItem.button else { return }
+        if popover.isShown {
+            popover.performClose(nil)
+        } else {
+            updateUI()
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        }
+    }
+
+    private func updateUI() {
         statsController?.update(records: store.records, apiCalls: store.apiCalls,
                                 activeAPICalls: store.activeAPICalls, sessionTitles: store.sessionTitles())
-        let menu = NSMenu()
-        menu.addItem(disabled("Codex Pulse"))
-        menu.addItem(.separator())
-
-        if let rate = snapshot {
-            menu.addItem(disabled(rateLine(label: windowLabel(rate.primaryMinutes), used: rate.primaryUsed, reset: rate.primaryReset)))
-            menu.addItem(disabled(rateLine(label: windowLabel(rate.secondaryMinutes), used: rate.secondaryUsed, reset: rate.secondaryReset)))
-            menu.addItem(.separator())
-            menu.addItem(disabled("套餐：\(rate.plan ?? "--")    Credits：\(formatCredits(rate.credits))"))
-            if let used = rate.primaryUsed {
-                statusItem.button?.title = " \(max(0, 100 - used))%"
-            }
-        } else {
-            menu.addItem(disabled("额度：暂时无法读取"))
-        }
-
-        menu.addItem(.separator())
         let totalModelCalls = store.records.reduce(0) { $0 + ($1.modelCalls ?? 0) }
-        menu.addItem(disabled("模型调用：已记录 \(compactNumber(totalModelCalls)) 次 · \(compactNumber(store.records.count)) 个任务"))
-        if let latest = store.records.first {
-            menu.addItem(disabled("模型：\(latest.model)    思考等级：\(latest.effort)"))
-            menu.addItem(disabled("首 Token：\(seconds(latest.ttftMS))    总时间：\(seconds(latest.durationMS))"))
-            menu.addItem(disabled("模型调用：\(compactNumber(latest.modelCalls ?? 0)) 次"))
-            menu.addItem(disabled("Token：\(compactNumber(latest.usage.total))  入 \(compactNumber(latest.usage.input))  出 \(compactNumber(latest.usage.output))  推理 \(compactNumber(latest.usage.reasoning))"))
-        } else {
-            menu.addItem(disabled("暂无已完成的 Codex 请求"))
-        }
-
-        let recent = NSMenuItem(title: "最近请求", action: nil, keyEquivalent: "")
-        let recentMenu = NSMenu()
-        for record in store.records.prefix(12) {
-            let title = "\(shortDate(record.timestamp))  \(record.model)  \(seconds(record.ttftMS)) / \(seconds(record.durationMS))  \(compactNumber(record.usage.total)) tok"
-            let item = disabled(title)
-            item.toolTip = "思考等级 \(record.effort) · 输入 \(compactNumber(record.usage.input)) · 缓存 \(compactNumber(record.usage.cached)) · 输出 \(compactNumber(record.usage.output)) · 推理 \(compactNumber(record.usage.reasoning))\nTurn: \(record.turnID)"
-            recentMenu.addItem(item)
-        }
-        if recentMenu.items.isEmpty { recentMenu.addItem(disabled("暂无数据")) }
-        recent.submenu = recentMenu
-        menu.addItem(recent)
-
-        let dashboard = NSMenuItem(title: "统计面板…", action: #selector(showStats), keyEquivalent: "d")
-        dashboard.target = self
-        menu.addItem(dashboard)
-        let open = NSMenuItem(title: "打开请求记录", action: #selector(openRecords), keyEquivalent: "o")
-        open.target = self
-        menu.addItem(open)
-        menu.addItem(.separator())
-        let refresh = NSMenuItem(title: "立即刷新", action: #selector(refresh), keyEquivalent: "r")
-        refresh.target = self
-        menu.addItem(refresh)
-        let quit = NSMenuItem(title: "退出 Codex Pulse", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        menu.addItem(quit)
-        statusItem.menu = menu
+        popoverController.update(snapshot: snapshot, totalModelCalls: totalModelCalls,
+                                 taskCount: store.records.count, activeCallCount: store.activeAPICalls.count,
+                                 latest: store.records.first, refreshedAt: Date())
+        if let used = snapshot?.secondaryUsed ?? snapshot?.primaryUsed { statusItem.button?.title = " \(max(0, 100 - used))%" }
     }
 
     @objc private func openRecords() {
@@ -723,6 +710,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let remaining = max(0, 100 - used)
         let resetText = reset.map { " · \(dateFormatter.string(from: $0)) 重置" } ?? ""
         return "\(label)：已用 \(used)% · 剩余 \(remaining)%\(resetText)"
+    }
+}
+
+private enum MembershipReader {
+    static func expiry() -> Date? {
+        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/auth.json")
+        guard let data = try? Data(contentsOf: url),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tokens = root["tokens"] as? [String: Any],
+              let token = tokens["id_token"] as? String else { return nil }
+        let parts = token.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count > 1 else { return nil }
+        var payload = String(parts[1]).replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        payload += String(repeating: "=", count: (4 - payload.count % 4) % 4)
+        guard let decoded = Data(base64Encoded: payload),
+              let claims = try? JSONSerialization.jsonObject(with: decoded) as? [String: Any],
+              let auth = claims["https://api.openai.com/auth"] as? [String: Any],
+              let value = auth["chatgpt_subscription_active_until"] as? String else { return nil }
+        return ISO8601DateFormatter().date(from: value)
     }
 }
 

@@ -8,7 +8,7 @@ CONTENTS="$OUT/Contents"
 rm -rf "$OUT"
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
 xcrun swiftc -swift-version 5 -O -framework AppKit -framework Foundation -lsqlite3 \
-  "$ROOT/CodexPulse.swift" "$ROOT/StatsPanel.swift" -o "$CONTENTS/MacOS/CodexPulse"
+  "$ROOT/CodexPulse.swift" "$ROOT/StatusPopover.swift" "$ROOT/StatsPanel.swift" -o "$CONTENTS/MacOS/CodexPulse"
 cp "$ROOT/Info.plist" "$CONTENTS/Info.plist"
 if [[ -f "$ROOT/Resources/CodexPulseIcon.icns" ]]; then
   cp "$ROOT/Resources/CodexPulseIcon.icns" "$CONTENTS/Resources/CodexPulseIcon.icns"
