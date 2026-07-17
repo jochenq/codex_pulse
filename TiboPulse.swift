@@ -48,7 +48,7 @@ final class TiboMonitor {
     init() {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 25
-        config.timeoutIntervalForResource = 35
+        config.timeoutIntervalForResource = 75
         config.httpMaximumConnectionsPerHost = 1
         session = URLSession(configuration: config)
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -290,7 +290,9 @@ final class TiboMonitor {
                 ["role": "user", "content": "以下按发布时间从新到旧排列：\n\n\(source)"]
             ],
             "temperature": 0.2,
-            "max_tokens": 180,
+            // Reasoning-capable compatible models count hidden reasoning toward this limit.
+            // Keep enough headroom so the short JSON answer is not truncated to empty content.
+            "max_tokens": 1024,
             "stream": false
         ]
         guard let json = try? JSONSerialization.data(withJSONObject: body) else {
@@ -300,7 +302,7 @@ final class TiboMonitor {
                                                           operation: "chat/completions") else {
             completion(.failure(MonitorError.invalidRequest)); return
         }
-        var request = URLRequest(url: endpoint, timeoutInterval: 35)
+        var request = URLRequest(url: endpoint, timeoutInterval: 60)
         request.httpMethod = "POST"
         request.httpBody = json
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
