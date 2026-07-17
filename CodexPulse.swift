@@ -532,7 +532,7 @@ final class RateLimitReader {
                         "clientInfo": [
                             "name": "codex_pulse_monitor",
                             "title": "Codex Pulse Monitor",
-                            "version": "2.10.1"
+                            "version": "2.10.2"
                         ]
                     ]
                 ],
@@ -650,6 +650,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func refresh() {
         guard !isRefreshing else { return }
         isRefreshing = true
+        popoverController.setRefreshing(true)
         if !hasLoadedOnce {
             statusItem.button?.title = " loading"
             popoverController.setLoading()

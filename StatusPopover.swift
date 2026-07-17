@@ -1,4 +1,7 @@
 import AppKit
+import QuartzCore
+
+private let premiumGold = NSColor(calibratedRed: 0.91, green: 0.70, blue: 0.24, alpha: 1)
 
 final class StatusPopoverController: NSViewController {
     var onRefresh: (() -> Void)?
@@ -12,13 +15,15 @@ final class StatusPopoverController: NSViewController {
     private let resetLabel = label("", size: 12, color: .secondaryLabelColor)
     private let progress = QuotaProgressView()
     private let shortQuotaLabel = label("", size: 12, color: .secondaryLabelColor)
-    private let resetCard = CardView(tint: .systemOrange)
-    private let resetCountLabel = label("0", size: 32, weight: .semibold)
-    private let resetExpiryLabel = label("暂无可用重置卡", size: 12, color: .secondaryLabelColor)
+    private let resetCard = PremiumResetCardView()
+    private let resetCountLabel = label("0", size: 32, weight: .semibold, color: premiumGold)
+    private let resetExpiryLabel = label("暂无可用重置卡", size: 12, color: NSColor.white.withAlphaComponent(0.74))
     private let callsValue = label("--", size: 18, weight: .semibold)
     private let tokensValue = label("--", size: 18, weight: .semibold)
     private let costValue = label("--", size: 18, weight: .semibold)
     private let updatedLabel = label("", size: 11, color: .tertiaryLabelColor)
+    private weak var refreshButton: NSButton?
+    private var refreshing = false
 
     override func loadView() {
         let root = NSVisualEffectView()
@@ -51,6 +56,7 @@ final class StatusPopoverController: NSViewController {
     }
 
     func setLoading() {
+        setRefreshing(true)
         ring.remaining = nil
         planLabel.stringValue = "LOADING"
         windowTitle.stringValue = "正在刷新"
@@ -66,6 +72,7 @@ final class StatusPopoverController: NSViewController {
 
     func update(snapshot: RateLimitReader.Snapshot?, todayCalls: Int, todayTokens: Int,
                 todayCost: Double?, refreshedAt: Date) {
+        setRefreshing(false)
         let mainUsed = snapshot?.secondaryUsed ?? snapshot?.primaryUsed
         let mainMinutes = snapshot?.secondaryUsed != nil ? snapshot?.secondaryMinutes : snapshot?.primaryMinutes
         let mainReset = snapshot?.secondaryUsed != nil ? snapshot?.secondaryReset : snapshot?.primaryReset
@@ -103,7 +110,10 @@ final class StatusPopoverController: NSViewController {
         NSLayoutConstraint.activate([icon.widthAnchor.constraint(equalToConstant: 28), icon.heightAnchor.constraint(equalToConstant: 28)])
         let title = label("Codex Pulse", size: 17, weight: .semibold)
         row.addArrangedSubview(icon); row.addArrangedSubview(title); row.addArrangedSubview(NSView()); row.addArrangedSubview(updatedLabel)
-        row.addArrangedSubview(iconButton("arrow.clockwise", toolTip: "立即刷新", action: #selector(refreshNow)))
+        let refresh = iconButton("arrow.clockwise", toolTip: "立即刷新", action: #selector(refreshNow))
+        refreshButton = refresh
+        row.addArrangedSubview(refresh)
+        if refreshing { startRefreshAnimation(on: refresh) }
         row.addArrangedSubview(iconButton("chart.bar.xaxis", toolTip: "打开统计面板", action: #selector(openDashboard)))
         let quit = iconButton("power", toolTip: "退出 Codex Pulse", action: #selector(quitApp))
         row.addArrangedSubview(quit)
@@ -144,9 +154,14 @@ final class StatusPopoverController: NSViewController {
         let image = ResetCreditIconView()
         NSLayoutConstraint.activate([image.widthAnchor.constraint(equalToConstant: 38), image.heightAnchor.constraint(equalToConstant: 38)])
         let text = NSStackView(); text.orientation = .vertical; text.alignment = .leading; text.spacing = 4
-        text.addArrangedSubview(label("重置卡", size: 15, weight: .semibold)); text.addArrangedSubview(resetExpiryLabel)
+        let titleRow = NSStackView(); titleRow.orientation = .horizontal; titleRow.alignment = .centerY; titleRow.spacing = 6
+        titleRow.addArrangedSubview(label("重置卡", size: 15, weight: .semibold, color: premiumGold))
+        let sparkle = NSImageView(image: NSImage(systemSymbolName: "sparkles", accessibilityDescription: nil) ?? NSImage())
+        sparkle.contentTintColor = premiumGold
+        titleRow.addArrangedSubview(sparkle)
+        text.addArrangedSubview(titleRow); text.addArrangedSubview(resetExpiryLabel)
         let count = NSStackView(); count.orientation = .vertical; count.alignment = .centerX; count.spacing = 0
-        count.addArrangedSubview(resetCountLabel); count.addArrangedSubview(label("枚可用", size: 11, color: .secondaryLabelColor))
+        count.addArrangedSubview(resetCountLabel); count.addArrangedSubview(label("枚可用", size: 11, weight: .medium, color: premiumGold.withAlphaComponent(0.82)))
         row.addArrangedSubview(image); row.addArrangedSubview(text); row.addArrangedSubview(NSView()); row.addArrangedSubview(count)
     }
 
@@ -164,6 +179,31 @@ final class StatusPopoverController: NSViewController {
     private func iconButton(_ symbol: String, toolTip: String, action: Selector) -> NSButton {
         let button = NSButton(image: NSImage(systemSymbolName: symbol, accessibilityDescription: toolTip) ?? NSImage(), target: self, action: action)
         button.isBordered = false; button.toolTip = toolTip; button.contentTintColor = .secondaryLabelColor; return button
+    }
+
+    func setRefreshing(_ value: Bool) {
+        refreshing = value
+        guard let button = refreshButton else { return }
+        if value {
+            startRefreshAnimation(on: button)
+        } else {
+            button.layer?.removeAnimation(forKey: "codex-pulse-refresh-spin")
+            button.layer?.setAffineTransform(.identity)
+            button.contentTintColor = .secondaryLabelColor
+        }
+    }
+
+    private func startRefreshAnimation(on button: NSButton) {
+        guard button.layer?.animation(forKey: "codex-pulse-refresh-spin") == nil else { return }
+        button.wantsLayer = true
+        button.contentTintColor = .systemBlue
+        let spin = CABasicAnimation(keyPath: "transform.rotation.z")
+        spin.fromValue = 0
+        spin.toValue = CGFloat.pi * 2
+        spin.duration = 0.75
+        spin.repeatCount = .infinity
+        spin.timingFunction = CAMediaTimingFunction(name: .linear)
+        button.layer?.add(spin, forKey: "codex-pulse-refresh-spin")
     }
 
     @objc private func refreshNow() { onRefresh?() }
@@ -193,16 +233,46 @@ private final class ResetCreditIconView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.backgroundColor = NSColor.systemOrange.cgColor
+        layer?.backgroundColor = premiumGold.cgColor
         layer?.cornerRadius = 19
         let image = NSImageView(image: NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "重置") ?? NSImage())
         image.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 21, weight: .semibold)
-        image.contentTintColor = .white
+        image.contentTintColor = NSColor(calibratedWhite: 0.08, alpha: 1)
         image.translatesAutoresizingMaskIntoConstraints = false
         addSubview(image)
         NSLayoutConstraint.activate([image.centerXAnchor.constraint(equalTo: centerXAnchor), image.centerYAnchor.constraint(equalTo: centerYAnchor)])
     }
     required init?(coder: NSCoder) { nil }
+}
+
+private final class PremiumResetCardView: NSView {
+    private let gradient = CAGradientLayer()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.cornerRadius = 14
+        layer?.masksToBounds = true
+        layer?.borderWidth = 1
+        layer?.borderColor = premiumGold.withAlphaComponent(0.62).cgColor
+        gradient.colors = [
+            NSColor(calibratedWhite: 0.035, alpha: 1).cgColor,
+            NSColor(calibratedRed: 0.16, green: 0.135, blue: 0.075, alpha: 1).cgColor,
+            NSColor(calibratedWhite: 0.055, alpha: 1).cgColor
+        ]
+        gradient.locations = [0, 0.56, 1]
+        gradient.startPoint = CGPoint(x: 0, y: 0.25)
+        gradient.endPoint = CGPoint(x: 1, y: 0.8)
+        gradient.cornerRadius = 14
+        layer?.insertSublayer(gradient, at: 0)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func layout() {
+        super.layout()
+        gradient.frame = bounds
+    }
 }
 
 private final class CardView: NSView {
