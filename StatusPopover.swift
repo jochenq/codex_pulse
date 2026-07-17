@@ -270,6 +270,7 @@ private final class TiboActivityCardView: NSView {
 
 private final class RefreshIconButton: NSButton {
     private let glyph = NSImageView()
+    private let spinner = NSProgressIndicator()
 
     init(target: AnyObject?, action: Selector?) {
         super.init(frame: .zero)
@@ -295,6 +296,18 @@ private final class RefreshIconButton: NSButton {
             glyph.widthAnchor.constraint(equalToConstant: 17),
             glyph.heightAnchor.constraint(equalToConstant: 17)
         ])
+
+        spinner.style = .spinning
+        spinner.controlSize = .small
+        spinner.isDisplayedWhenStopped = false
+        spinner.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(spinner)
+        NSLayoutConstraint.activate([
+            spinner.centerXAnchor.constraint(equalTo: centerXAnchor),
+            spinner.centerYAnchor.constraint(equalTo: centerYAnchor),
+            spinner.widthAnchor.constraint(equalToConstant: 14),
+            spinner.heightAnchor.constraint(equalToConstant: 14)
+        ])
     }
 
     required init?(coder: NSCoder) { nil }
@@ -304,22 +317,12 @@ private final class RefreshIconButton: NSButton {
     }
 
     func setSpinning(_ spinning: Bool) {
-        layoutSubtreeIfNeeded()
-        glyph.wantsLayer = true
         if spinning {
-            guard glyph.layer?.animation(forKey: "codex-pulse-refresh-spin") == nil else { return }
-            glyph.contentTintColor = .systemBlue
-            let spin = CABasicAnimation(keyPath: "transform.rotation.z")
-            spin.fromValue = 0
-            spin.toValue = CGFloat.pi * 2
-            spin.duration = 0.75
-            spin.repeatCount = .infinity
-            spin.timingFunction = CAMediaTimingFunction(name: .linear)
-            glyph.layer?.add(spin, forKey: "codex-pulse-refresh-spin")
+            glyph.isHidden = true
+            spinner.startAnimation(nil)
         } else {
-            glyph.layer?.removeAnimation(forKey: "codex-pulse-refresh-spin")
-            glyph.layer?.setAffineTransform(.identity)
-            glyph.contentTintColor = .secondaryLabelColor
+            spinner.stopAnimation(nil)
+            glyph.isHidden = false
         }
     }
 }
