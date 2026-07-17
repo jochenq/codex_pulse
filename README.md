@@ -24,7 +24,7 @@ open "../Codex Pulse Monitor.app"
 
 菜单栏浮窗显示 7 天额度、重置卡以及“今日调用次数 / 今日 Token 总数 / 今日等价花费”；点击浮窗外部会自动收起。ChatGPT 订阅续费日期目前没有公开、稳定的 Codex 账户接口，因此应用不显示或推算续费日期。
 
-浮窗底部还会显示 Tibo（`@thsottiaux`）的公开动态摘要。应用每 5 分钟静默检查一次 X 公开个人页，并用帖子 ID、发布时间与正文生成内容指纹；只有内容指纹变化时才调用 DeepSeek，未变化时仅更新检查时间。最近一次成功摘要缓存在 `~/Library/Application Support/Codex Pulse/tibo-activity.json`，网络或模型调用失败时继续显示缓存，不会清空。
+浮窗底部还会显示 Tibo（`@thsottiaux`）的公开动态摘要。应用每 5 分钟静默检查一次实时公开镜像，并以 X 官方公开页和 Embed 时间线作为回退；帖子时间由状态 ID 校验，所有来源若都超过 14 天会明确显示“时间线已过期”，不会把旧帖当新闻。应用用帖子 ID、发布时间与正文生成内容指纹；只有内容指纹变化时才调用 DeepSeek，未变化时仅更新检查时间。最近一次成功摘要缓存在 `~/Library/Application Support/Codex Pulse/tibo-activity.json`。
 
 DeepSeek Key 只从进程环境读取，名称为 `DEEPSEEK_API_KEY`，不会写入源码或缓存。使用 Finder 启动应用时，可为当前 macOS 登录会话配置：
 

@@ -27,6 +27,7 @@ final class StatusPopoverController: NSViewController {
     private let tiboSummary = label("首次分析完成后会显示在这里。", size: 11, color: .secondaryLabelColor)
     private let tiboMeta = label("尚未检查", size: 10, color: .tertiaryLabelColor)
     private let tiboStatusDot = StatusDotView()
+    private let tiboSectionTitle = label("Tibo 动态", size: 12, weight: .semibold, color: .systemBlue)
     private weak var refreshButton: RefreshIconButton?
     private var refreshing = false
 
@@ -111,13 +112,14 @@ final class StatusPopoverController: NSViewController {
     }
 
     func updateTibo(_ snapshot: TiboActivitySnapshot) {
+        tiboSectionTitle.stringValue = "Tibo " + (snapshot.activityState?.isEmpty == false ? snapshot.activityState! : "动态")
         tiboHeadline.stringValue = snapshot.headline
         tiboSummary.stringValue = snapshot.summary
         let checked = snapshot.checkedAt == .distantPast ? "尚未检查" : "检查于 \(timeOnly(snapshot.checkedAt))"
         let latest = snapshot.latestPostAt.map { " · 最近发帖 \(shortActivityDate($0))" } ?? ""
         switch snapshot.status {
         case "current":
-            tiboStatusDot.color = NSColor(calibratedRed: 0.38, green: 0.47, blue: 0.50, alpha: 0.72)
+            tiboStatusDot.color = NSColor(calibratedRed: 0.10, green: 0.82, blue: 0.38, alpha: 1)
             tiboMeta.stringValue = checked + latest
         case "loading":
             tiboStatusDot.color = NSColor.systemBlue.withAlphaComponent(0.55)
@@ -210,9 +212,9 @@ final class StatusPopoverController: NSViewController {
             content.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -9)
         ])
         let header = NSStackView(); header.orientation = .horizontal; header.alignment = .centerY; header.spacing = 7
-        NSLayoutConstraint.activate([tiboStatusDot.widthAnchor.constraint(equalToConstant: 6), tiboStatusDot.heightAnchor.constraint(equalToConstant: 6)])
+        NSLayoutConstraint.activate([tiboStatusDot.widthAnchor.constraint(equalToConstant: 7), tiboStatusDot.heightAnchor.constraint(equalToConstant: 7)])
         header.addArrangedSubview(tiboStatusDot)
-        header.addArrangedSubview(label("Tibo在干啥", size: 12, weight: .semibold, color: .systemBlue))
+        header.addArrangedSubview(tiboSectionTitle)
         header.addArrangedSubview(NSView())
         let source = NSButton(title: "查看原帖 ↗", target: self, action: #selector(openTibo))
         source.isBordered = false; source.font = .systemFont(ofSize: 10, weight: .medium); source.contentTintColor = .secondaryLabelColor
@@ -249,7 +251,7 @@ final class StatusPopoverController: NSViewController {
 }
 
 private final class StatusDotView: NSView {
-    var color: NSColor = NSColor(calibratedRed: 0.38, green: 0.47, blue: 0.50, alpha: 0.72) { didSet { needsDisplay = true } }
+    var color: NSColor = NSColor(calibratedRed: 0.10, green: 0.82, blue: 0.38, alpha: 1) { didSet { needsDisplay = true } }
     override func draw(_ dirtyRect: NSRect) {
         color.setFill()
         NSBezierPath(ovalIn: bounds).fill()
