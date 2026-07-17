@@ -30,7 +30,8 @@ final class StatusPopoverController: NSViewController {
     private let tiboLocalTime = label("旧金山湾区 / PT", size: 10, weight: .medium, color: .secondaryLabelColor)
     private let tiboMeta = label("尚未检查", size: 10, color: .tertiaryLabelColor)
     private let tiboAvatar = NSImageView(image: NSImage(systemSymbolName: "person.crop.circle.fill", accessibilityDescription: "Tibo 头像") ?? NSImage())
-    private let tiboSectionTitle = label("Tibo 动态", size: 12, weight: .semibold)
+    private let tiboSectionTitle = label("Tibo", size: 12, weight: .semibold)
+    private let tiboStateLabel = label("动态", size: 12, weight: .semibold, color: .systemGreen)
     private weak var refreshButton: RefreshIconButton?
     private var refreshing = false
     private var loadedTiboAvatarURL: String?
@@ -127,7 +128,7 @@ final class StatusPopoverController: NSViewController {
 
     func updateTibo(_ snapshot: TiboActivitySnapshot) {
         latestTiboSnapshot = snapshot
-        tiboSectionTitle.stringValue = "Tibo " + displayTiboState(snapshot)
+        tiboStateLabel.stringValue = displayTiboState(snapshot)
         tiboHeadline.stringValue = displayTiboHeadline(snapshot.headline)
         tiboSummary.stringValue = snapshot.summary
         tiboLocalTime.stringValue = tiboPlaceAndTime(snapshot)
@@ -232,6 +233,7 @@ final class StatusPopoverController: NSViewController {
         NSLayoutConstraint.activate([tiboAvatar.widthAnchor.constraint(equalToConstant: 22), tiboAvatar.heightAnchor.constraint(equalToConstant: 22)])
         header.addArrangedSubview(tiboAvatar)
         header.addArrangedSubview(tiboSectionTitle)
+        header.addArrangedSubview(tiboStateLabel)
         let settings = iconButton("slider.horizontal.3", toolTip: "配置 Tibo AI", action: #selector(configureAI))
         settings.controlSize = .small
         settings.contentTintColor = .secondaryLabelColor
