@@ -6,6 +6,7 @@ private let premiumGold = NSColor(calibratedRed: 0.91, green: 0.70, blue: 0.24, 
 final class StatusPopoverController: NSViewController {
     var onRefresh: (() -> Void)?
     var onOpenDashboard: (() -> Void)?
+    var onOpenTibo: (() -> Void)?
     var onQuit: (() -> Void)?
 
     private let ring = QuotaRingView()
@@ -22,6 +23,10 @@ final class StatusPopoverController: NSViewController {
     private let tokensValue = label("--", size: 18, weight: .semibold)
     private let costValue = label("--", size: 18, weight: .semibold)
     private let updatedLabel = label("", size: 11, color: .tertiaryLabelColor)
+    private let tiboHeadline = label("正在获取公开动态", size: 13, weight: .semibold)
+    private let tiboSummary = label("首次分析完成后会显示在这里。", size: 11, color: .secondaryLabelColor)
+    private let tiboMeta = label("尚未检查", size: 10, color: .tertiaryLabelColor)
+    private let tiboStatusDot = StatusDotView()
     private weak var refreshButton: RefreshIconButton?
     private var refreshing = false
 
@@ -32,7 +37,7 @@ final class StatusPopoverController: NSViewController {
         root.state = .active
         root.translatesAutoresizingMaskIntoConstraints = false
         view = root
-        preferredContentSize = NSSize(width: 398, height: 412)
+        preferredContentSize = NSSize(width: 398, height: 516)
 
         let content = NSStackView()
         content.orientation = .vertical
@@ -52,6 +57,7 @@ final class StatusPopoverController: NSViewController {
         content.addArrangedSubview(resetCard)
         setupResetCard()
         content.addArrangedSubview(makeStatsRow())
+        content.addArrangedSubview(makeTiboCard())
         for child in content.arrangedSubviews { child.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true }
     }
 
@@ -102,6 +108,27 @@ final class StatusPopoverController: NSViewController {
         tokensValue.stringValue = compactNumber(todayTokens)
         costValue.stringValue = formatUSD(todayCost)
         updatedLabel.stringValue = "更新于 " + timeOnly(refreshedAt)
+    }
+
+    func updateTibo(_ snapshot: TiboActivitySnapshot) {
+        tiboHeadline.stringValue = snapshot.headline
+        tiboSummary.stringValue = snapshot.summary
+        let checked = snapshot.checkedAt == .distantPast ? "尚未检查" : "检查于 \(timeOnly(snapshot.checkedAt))"
+        let latest = snapshot.latestPostAt.map { " · 最近发帖 \(shortActivityDate($0))" } ?? ""
+        switch snapshot.status {
+        case "current":
+            tiboStatusDot.color = .systemGreen
+            tiboMeta.stringValue = checked + latest
+        case "loading":
+            tiboStatusDot.color = .systemBlue
+            tiboMeta.stringValue = "正在读取公开动态…"
+        case "missing-key":
+            tiboStatusDot.color = .systemOrange
+            tiboMeta.stringValue = "DeepSeek 环境变量未配置 · " + checked
+        default:
+            tiboStatusDot.color = .systemOrange
+            tiboMeta.stringValue = "本次检查未完成，保留上次摘要 · " + checked
+        }
     }
 
     private func makeHeader() -> NSView {
@@ -171,6 +198,35 @@ final class StatusPopoverController: NSViewController {
         return row
     }
 
+    private func makeTiboCard() -> NSView {
+        let card = TiboActivityCardView()
+        let content = NSStackView(); content.orientation = .vertical; content.alignment = .leading; content.spacing = 5; content.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(content)
+        NSLayoutConstraint.activate([
+            card.heightAnchor.constraint(equalToConstant: 92),
+            content.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 13),
+            content.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -13),
+            content.topAnchor.constraint(equalTo: card.topAnchor, constant: 10),
+            content.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -9)
+        ])
+        let header = NSStackView(); header.orientation = .horizontal; header.alignment = .centerY; header.spacing = 7
+        NSLayoutConstraint.activate([tiboStatusDot.widthAnchor.constraint(equalToConstant: 7), tiboStatusDot.heightAnchor.constraint(equalToConstant: 7)])
+        header.addArrangedSubview(tiboStatusDot)
+        header.addArrangedSubview(label("Tibo 动态", size: 12, weight: .semibold, color: .systemBlue))
+        header.addArrangedSubview(NSView())
+        let source = NSButton(title: "查看原帖 ↗", target: self, action: #selector(openTibo))
+        source.isBordered = false; source.font = .systemFont(ofSize: 10, weight: .medium); source.contentTintColor = .secondaryLabelColor
+        header.addArrangedSubview(source)
+        content.addArrangedSubview(header); header.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
+        content.addArrangedSubview(tiboHeadline)
+        tiboSummary.lineBreakMode = .byWordWrapping
+        tiboSummary.maximumNumberOfLines = 2
+        tiboSummary.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        content.addArrangedSubview(tiboSummary); tiboSummary.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
+        content.addArrangedSubview(tiboMeta)
+        return card
+    }
+
     private func stat(_ title: String, _ value: NSTextField) -> NSView {
         let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .centerX; stack.spacing = 3
         stack.addArrangedSubview(value); stack.addArrangedSubview(label(title, size: 11, color: .secondaryLabelColor)); return stack
@@ -188,7 +244,28 @@ final class StatusPopoverController: NSViewController {
 
     @objc private func refreshNow() { onRefresh?() }
     @objc private func openDashboard() { onOpenDashboard?() }
+    @objc private func openTibo() { onOpenTibo?() }
     @objc private func quitApp() { onQuit?() }
+}
+
+private final class StatusDotView: NSView {
+    var color: NSColor = .systemBlue { didSet { needsDisplay = true } }
+    override func draw(_ dirtyRect: NSRect) {
+        color.setFill()
+        NSBezierPath(ovalIn: bounds).fill()
+    }
+}
+
+private final class TiboActivityCardView: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.cornerRadius = 12
+        layer?.backgroundColor = NSColor.systemBlue.withAlphaComponent(0.055).cgColor
+        layer?.borderColor = NSColor.systemBlue.withAlphaComponent(0.14).cgColor
+        layer?.borderWidth = 1
+    }
+    required init?(coder: NSCoder) { nil }
 }
 
 private final class RefreshIconButton: NSButton {
@@ -356,6 +433,14 @@ private final class QuotaRingView: NSView {
 
 private func label(_ text: String, size: CGFloat, weight: NSFont.Weight = .regular, color: NSColor = .labelColor) -> NSTextField {
     let field = NSTextField(labelWithString: text); field.font = .systemFont(ofSize: size, weight: weight); field.textColor = color; field.lineBreakMode = .byTruncatingTail; return field
+}
+
+private func shortActivityDate(_ date: Date) -> String {
+    if Calendar.current.isDateInToday(date) { return timeOnly(date) }
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "zh_CN")
+    formatter.dateFormat = "M月d日"
+    return formatter.string(from: date)
 }
 
 private func windowName(_ minutes: Int?) -> String {

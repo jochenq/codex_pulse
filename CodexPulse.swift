@@ -600,9 +600,12 @@ final class RateLimitReader {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let store = MetricStore()
     private let rateReader = RateLimitReader()
+    private let tiboMonitor = TiboMonitor()
     private var snapshot: RateLimitReader.Snapshot?
+    private var tiboSnapshot: TiboActivitySnapshot
     private var statusItem: NSStatusItem!
     private var timer: Timer?
+    private var tiboTimer: Timer?
     private var liveTimer: Timer?
     private var isRefreshing = false
     private var isLivePolling = false
@@ -613,6 +616,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hasLoadedOnce = false
     private var outsideClickMonitor: Any?
 
+    override init() {
+        tiboSnapshot = tiboMonitor.snapshot
+        super.init()
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -622,6 +630,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popoverController = StatusPopoverController()
         popoverController.onRefresh = { [weak self] in self?.refresh() }
         popoverController.onOpenDashboard = { [weak self] in self?.popover.performClose(nil); self?.showStats() }
+        popoverController.onOpenTibo = { NSWorkspace.shared.open(URL(string: "https://x.com/thsottiaux")!) }
         popoverController.onQuit = { NSApp.terminate(nil) }
         popover = NSPopover()
         popover.behavior = .transient
@@ -633,7 +642,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePopover)
         refresh()
+        refreshTibo()
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.refresh() }
+        tiboTimer = Timer.scheduledTimer(withTimeInterval: 5 * 60, repeats: true) { [weak self] _ in self?.refreshTibo() }
         liveTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.pollLiveMetrics() }
         if CommandLine.arguments.contains("--show-stats") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.showStats() }
@@ -644,7 +655,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        timer?.invalidate()
+        tiboTimer?.invalidate()
+        liveTimer?.invalidate()
         if let outsideClickMonitor { NSEvent.removeMonitor(outsideClickMonitor) }
+    }
+
+    private func refreshTibo() {
+        tiboMonitor.check { [weak self] snapshot in
+            guard let self else { return }
+            self.tiboSnapshot = snapshot
+            self.popoverController.updateTibo(snapshot)
+        }
     }
 
     @objc private func refresh() {
@@ -712,6 +734,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let todayTokens = todayRecords.reduce(0) { $0 + $1.usage.total }
         popoverController.update(snapshot: snapshot, todayCalls: todayCalls, todayTokens: todayTokens,
                                  todayCost: summedAPICost(todayRecords), refreshedAt: Date())
+        popoverController.updateTibo(tiboSnapshot)
         if let used = snapshot?.secondaryUsed ?? snapshot?.primaryUsed {
             statusItem.button?.title = " \(max(0, 100 - used))%"
         } else {

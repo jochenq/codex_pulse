@@ -3,6 +3,8 @@
 *.xcarchive
 DerivedData/
 build/
+.env
+.env.*
 Codex Pulse Monitor.app/
 requests.jsonl
 scan-state.json
