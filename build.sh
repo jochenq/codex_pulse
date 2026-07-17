@@ -15,5 +15,8 @@ if [[ -f "$ROOT/Resources/CodexPulseIcon.icns" ]]; then
 elif [[ -f "/Applications/Codex Pulse.app/Contents/Resources/CodexPulseIcon.icns" ]]; then
   cp "/Applications/Codex Pulse.app/Contents/Resources/CodexPulseIcon.icns" "$CONTENTS/Resources/CodexPulseIcon.icns"
 fi
+if [[ -f "$ROOT/Resources/ResetCardTibo.png" ]]; then
+  cp "$ROOT/Resources/ResetCardTibo.png" "$CONTENTS/Resources/ResetCardTibo.png"
+fi
 codesign --force --deep --sign - "$OUT"
 echo "$OUT"

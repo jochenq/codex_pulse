@@ -32,7 +32,7 @@ final class StatusPopoverController: NSViewController {
         root.state = .active
         root.translatesAutoresizingMaskIntoConstraints = false
         view = root
-        preferredContentSize = NSSize(width: 398, height: 390)
+        preferredContentSize = NSSize(width: 398, height: 412)
 
         let content = NSStackView()
         content.orientation = .vertical
@@ -152,7 +152,7 @@ final class StatusPopoverController: NSViewController {
         resetCard.addSubview(row)
         NSLayoutConstraint.activate([row.leadingAnchor.constraint(equalTo: resetCard.leadingAnchor, constant: 15), row.trailingAnchor.constraint(equalTo: resetCard.trailingAnchor, constant: -15), row.topAnchor.constraint(equalTo: resetCard.topAnchor, constant: 12), row.bottomAnchor.constraint(equalTo: resetCard.bottomAnchor, constant: -12)])
         let image = ResetCreditIconView()
-        NSLayoutConstraint.activate([image.widthAnchor.constraint(equalToConstant: 38), image.heightAnchor.constraint(equalToConstant: 38)])
+        NSLayoutConstraint.activate([image.widthAnchor.constraint(equalToConstant: 40), image.heightAnchor.constraint(equalToConstant: 60)])
         let text = NSStackView(); text.orientation = .vertical; text.alignment = .leading; text.spacing = 4
         let titleRow = NSStackView(); titleRow.orientation = .horizontal; titleRow.alignment = .centerY; titleRow.spacing = 6
         titleRow.addArrangedSubview(label("重置卡", size: 15, weight: .semibold, color: premiumGold))
@@ -269,14 +269,24 @@ private final class ResetCreditIconView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.backgroundColor = premiumGold.cgColor
-        layer?.cornerRadius = 19
-        let image = NSImageView(image: NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "重置") ?? NSImage())
-        image.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 21, weight: .semibold)
-        image.contentTintColor = NSColor(calibratedWhite: 0.08, alpha: 1)
+        layer?.backgroundColor = NSColor(calibratedWhite: 0.04, alpha: 1).cgColor
+        layer?.cornerRadius = 6
+        layer?.masksToBounds = true
+        layer?.borderWidth = 1
+        layer?.borderColor = premiumGold.withAlphaComponent(0.82).cgColor
+        let image = NSImageView()
+        if let url = Bundle.main.url(forResource: "ResetCardTibo", withExtension: "png") {
+            image.image = NSImage(contentsOf: url)
+        }
+        image.imageScaling = .scaleProportionallyUpOrDown
         image.translatesAutoresizingMaskIntoConstraints = false
         addSubview(image)
-        NSLayoutConstraint.activate([image.centerXAnchor.constraint(equalTo: centerXAnchor), image.centerYAnchor.constraint(equalTo: centerYAnchor)])
+        NSLayoutConstraint.activate([
+            image.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 1),
+            image.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -1),
+            image.topAnchor.constraint(equalTo: topAnchor, constant: 1),
+            image.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -1)
+        ])
     }
     required init?(coder: NSCoder) { nil }
 }
