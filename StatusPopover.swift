@@ -72,6 +72,7 @@ final class StatusPopoverController: NSViewController {
         let clockTimer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
             guard let self, let snapshot = self.latestTiboSnapshot else { return }
             self.tiboLocalTime.stringValue = tiboPlaceAndTime(snapshot)
+            self.tiboStateLabel.stringValue = displayTiboState(snapshot)
         }
         RunLoop.main.add(clockTimer, forMode: .common)
         tiboClockTimer = clockTimer
@@ -507,8 +508,7 @@ private func tiboPlaceAndTime(_ snapshot: TiboActivitySnapshot) -> String {
 }
 
 private func displayTiboState(_ snapshot: TiboActivitySnapshot) -> String {
-    let allowed = ["工作", "开会", "发帖", "吃饭", "休息", "睡觉", "休假", "出行", "离线"]
-    if let state = snapshot.activityState, allowed.contains(state) { return state }
+    if snapshot.activityState == "休假" { return "休假" }
     let timeZone = TimeZone(identifier: snapshot.timeZoneIdentifier ?? "America/Los_Angeles")
         ?? TimeZone(identifier: "America/Los_Angeles")!
     var calendar = Calendar(identifier: .gregorian)
