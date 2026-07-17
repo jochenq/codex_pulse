@@ -7,6 +7,7 @@ final class StatusPopoverController: NSViewController {
     var onRefresh: (() -> Void)?
     var onOpenDashboard: (() -> Void)?
     var onOpenTibo: (() -> Void)?
+    var onConfigureAI: (() -> Void)?
     var onQuit: (() -> Void)?
 
     private let ring = QuotaRingView()
@@ -124,9 +125,9 @@ final class StatusPopoverController: NSViewController {
         case "loading":
             tiboStatusDot.color = NSColor.systemBlue.withAlphaComponent(0.55)
             tiboMeta.stringValue = "正在读取公开动态…"
-        case "missing-key":
+        case "missing-configuration":
             tiboStatusDot.color = NSColor.systemOrange.withAlphaComponent(0.58)
-            tiboMeta.stringValue = "DeepSeek 环境变量未配置 · " + checked
+            tiboMeta.stringValue = "请配置 AI 服务 · " + checked
         default:
             tiboStatusDot.color = NSColor.systemOrange.withAlphaComponent(0.58)
             tiboMeta.stringValue = "本次检查未完成，保留上次摘要 · " + checked
@@ -215,6 +216,10 @@ final class StatusPopoverController: NSViewController {
         NSLayoutConstraint.activate([tiboStatusDot.widthAnchor.constraint(equalToConstant: 7), tiboStatusDot.heightAnchor.constraint(equalToConstant: 7)])
         header.addArrangedSubview(tiboStatusDot)
         header.addArrangedSubview(tiboSectionTitle)
+        let settings = iconButton("slider.horizontal.3", toolTip: "配置 Tibo AI", action: #selector(configureAI))
+        settings.controlSize = .small
+        settings.contentTintColor = .secondaryLabelColor
+        header.addArrangedSubview(settings)
         header.addArrangedSubview(NSView())
         let source = NSButton(title: "查看原帖 ↗", target: self, action: #selector(openTibo))
         source.isBordered = false; source.font = .systemFont(ofSize: 10, weight: .medium); source.contentTintColor = .secondaryLabelColor
@@ -247,6 +252,7 @@ final class StatusPopoverController: NSViewController {
     @objc private func refreshNow() { onRefresh?() }
     @objc private func openDashboard() { onOpenDashboard?() }
     @objc private func openTibo() { onOpenTibo?() }
+    @objc private func configureAI() { onConfigureAI?() }
     @objc private func quitApp() { onQuit?() }
 }
 

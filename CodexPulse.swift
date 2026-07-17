@@ -611,6 +611,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isLivePolling = false
     private let storeQueue = DispatchQueue(label: "com.codexpulse.metric-store", qos: .utility)
     private var statsController: StatsWindowController?
+    private var aiConfigurationController: AIConfigurationWindowController?
     private var popover: NSPopover!
     private var popoverController: StatusPopoverController!
     private var hasLoadedOnce = false
@@ -631,6 +632,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popoverController.onRefresh = { [weak self] in self?.refresh() }
         popoverController.onOpenDashboard = { [weak self] in self?.popover.performClose(nil); self?.showStats() }
         popoverController.onOpenTibo = { NSWorkspace.shared.open(URL(string: "https://x.com/thsottiaux")!) }
+        popoverController.onConfigureAI = { [weak self] in self?.showAIConfiguration() }
         popoverController.onQuit = { NSApp.terminate(nil) }
         popover = NSPopover()
         popover.behavior = .transient
@@ -661,12 +663,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let outsideClickMonitor { NSEvent.removeMonitor(outsideClickMonitor) }
     }
 
-    private func refreshTibo() {
-        tiboMonitor.check { [weak self] snapshot in
+    private func refreshTibo(forceAnalysis: Bool = false) {
+        tiboMonitor.check(forceAnalysis: forceAnalysis) { [weak self] snapshot in
             guard let self else { return }
             self.tiboSnapshot = snapshot
             self.popoverController.updateTibo(snapshot)
         }
+    }
+
+    private func showAIConfiguration() {
+        popover.performClose(nil)
+        if aiConfigurationController == nil {
+            aiConfigurationController = AIConfigurationWindowController { [weak self] _ in
+                self?.refreshTibo(forceAnalysis: true)
+            }
+        }
+        aiConfigurationController?.show()
     }
 
     @objc private func refresh() {

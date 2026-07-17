@@ -24,15 +24,11 @@ open "../Codex Pulse Monitor.app"
 
 菜单栏浮窗显示 7 天额度、重置卡以及“今日调用次数 / 今日 Token 总数 / 今日等价花费”；点击浮窗外部会自动收起。ChatGPT 订阅续费日期目前没有公开、稳定的 Codex 账户接口，因此应用不显示或推算续费日期。
 
-浮窗底部还会显示 Tibo（`@thsottiaux`）的公开动态摘要。应用每 5 分钟静默检查一次实时公开镜像，并以 X 官方公开页和 Embed 时间线作为回退；帖子时间由状态 ID 校验，所有来源若都超过 14 天会明确显示“时间线已过期”，不会把旧帖当新闻。应用用帖子 ID、发布时间与正文生成内容指纹；只有内容指纹变化时才调用 DeepSeek，未变化时仅更新检查时间。最近一次成功摘要缓存在 `~/Library/Application Support/Codex Pulse/tibo-activity.json`。
+浮窗底部还会显示 Tibo（`@thsottiaux`）的公开动态摘要。应用每 5 分钟静默检查一次实时公开镜像，并以 X 官方公开页和 Embed 时间线作为回退；帖子时间由状态 ID 校验，所有来源若都超过 14 天会明确显示“时间线已过期”，不会把旧帖当新闻。应用用帖子 ID、发布时间与正文生成内容指纹；只有内容指纹变化时才调用已配置的 AI 服务，未变化时仅更新检查时间。最近一次成功摘要缓存在 `~/Library/Application Support/Codex Pulse/tibo-activity.json`。
 
-DeepSeek Key 只从进程环境读取，名称为 `DEEPSEEK_API_KEY`，不会写入源码或缓存。使用 Finder 启动应用时，可为当前 macOS 登录会话配置：
+点击“Tibo 动态”旁的设置按钮可配置任意 OpenAI Chat Completions 兼容服务，包括 Base URL、API Key 和模型。应用可通过兼容的 `GET /models` 接口自动拉取模型列表，也允许手动输入模型 ID。Base URL 与模型保存在本地偏好，API Key 保存在 macOS Keychain；应用不再读取 `DEEPSEEK_API_KEY` 或其他 AI 环境变量。
 
-```sh
-launchctl setenv DEEPSEEK_API_KEY '你的 Key'
-```
-
-配置后需要退出并重新打开 Codex Pulse。摘要使用 `deepseek-v4-flash` 的非思考模式，并限制为简短的中文事实摘要；不会推测位置、作息或其他私人信息。
+保存配置后会立即重新分析，无需重启 Codex Pulse。摘要使用所选模型生成简短的中文事实摘要；不会推测位置、作息或其他私人信息。
 
 Token 数字会自动使用 `K`、`M`、`B` 紧凑显示。点击菜单中的“统计面板…”（`⌘D`）可打开原生统计窗口，支持：
 

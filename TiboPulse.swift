@@ -28,7 +28,7 @@ private struct TiboPost {
     let url: String
 }
 
-private struct DeepSeekDigest: Decodable {
+private struct AIActivityDigest: Decodable {
     let state: String
     let headline: String
     let summary: String
@@ -38,11 +38,11 @@ final class TiboMonitor {
     private let profileURL = URL(string: "https://x.com/thsottiaux")!
     private let liveMirrorURL = URL(string: "https://r.jina.ai/http://twstalker.com/thsottiaux")!
     private let syndicationURL = URL(string: "https://syndication.twitter.com/srv/timeline-profile/screen-name/thsottiaux")!
-    private let deepSeekURL = URL(string: "https://api.deepseek.com/chat/completions")!
     private let queue = DispatchQueue(label: "com.codexpulse.tibo-monitor", qos: .utility)
     private let session: URLSession
     private let cacheURL: URL
     private var running = false
+    private var pendingForcedCompletion: ((TiboActivitySnapshot) -> Void)?
     private(set) var snapshot: TiboActivitySnapshot
 
     init() {
@@ -63,14 +63,18 @@ final class TiboMonitor {
         }
     }
 
-    func check(completion: @escaping (TiboActivitySnapshot) -> Void) {
+    func check(forceAnalysis: Bool = false, completion: @escaping (TiboActivitySnapshot) -> Void) {
         queue.async { [weak self] in
-            guard let self, !self.running else { return }
+            guard let self else { return }
+            if self.running {
+                if forceAnalysis { self.pendingForcedCompletion = completion }
+                return
+            }
             self.running = true
             self.fetchPosts { result in
                 self.queue.async {
                     switch result {
-                    case .success(let posts): self.handle(posts: posts, completion: completion)
+                    case .success(let posts): self.handle(posts: posts, forceAnalysis: forceAnalysis, completion: completion)
                     case .failure:
                         self.snapshot.checkedAt = Date()
                         if self.snapshot.latestPostAt.map({ Date().timeIntervalSince($0) > 14 * 24 * 60 * 60 }) ?? false {
@@ -222,24 +226,26 @@ final class TiboMonitor {
         return posts.sorted { $0.publishedAt > $1.publishedAt }.prefix(8).map { $0 }
     }
 
-    private func handle(posts: [TiboPost], completion: @escaping (TiboActivitySnapshot) -> Void) {
+    private func handle(posts: [TiboPost], forceAnalysis: Bool,
+                        completion: @escaping (TiboActivitySnapshot) -> Void) {
         let canonical = "tibo-reset-radar-v4\n" + posts.map { "\($0.id)|\(Int($0.publishedAt.timeIntervalSince1970))|\($0.text)" }.joined(separator: "\n")
         let fingerprint = SHA256.hash(data: Data(canonical.utf8)).map { String(format: "%02x", $0) }.joined()
-        if fingerprint == snapshot.fingerprint, snapshot.analyzedAt != nil {
+        let configuration = AIConfigurationStore.shared.load()
+        guard configuration.isConfigured else {
+            snapshot.checkedAt = Date()
+            snapshot.status = "missing-configuration"
+            save()
+            finish(completion)
+            return
+        }
+        if !forceAnalysis, fingerprint == snapshot.fingerprint, snapshot.analyzedAt != nil {
             snapshot.checkedAt = Date()
             snapshot.status = "current"
             save()
             finish(completion)
             return
         }
-        guard let key = ProcessInfo.processInfo.environment["DEEPSEEK_API_KEY"], !key.isEmpty else {
-            snapshot.checkedAt = Date()
-            snapshot.status = "missing-key"
-            save()
-            finish(completion)
-            return
-        }
-        analyze(posts: posts, apiKey: key) { result in
+        analyze(posts: posts, configuration: configuration) { result in
             self.queue.async {
                 switch result {
                 case .success(let digest):
@@ -263,7 +269,8 @@ final class TiboMonitor {
         }
     }
 
-    private func analyze(posts: [TiboPost], apiKey: String, completion: @escaping (Result<DeepSeekDigest, Error>) -> Void) {
+    private func analyze(posts: [TiboPost], configuration: AIServiceConfiguration,
+                         completion: @escaping (Result<AIActivityDigest, Error>) -> Void) {
         let formatter = ISO8601DateFormatter()
         let source = posts.enumerated().map { index, post in
             "[\(index + 1)] \(formatter.string(from: post.publishedAt))\n\(post.text)\n\(post.url)"
@@ -277,13 +284,11 @@ final class TiboMonitor {
         不使用营销腔；不得在结果中出现“帖子1”“帖子7”之类的内部编号。只输出 JSON，不要 Markdown：{"state":"不超过5个汉字","headline":"不超过14个汉字","summary":"1到2句，不超过66个汉字"}。输出前自行检查长度，超出必须压缩。
         """
         let body: [String: Any] = [
-            "model": "deepseek-v4-flash",
+            "model": configuration.model,
             "messages": [
                 ["role": "system", "content": system],
                 ["role": "user", "content": "以下按发布时间从新到旧排列：\n\n\(source)"]
             ],
-            "thinking": ["type": "disabled"],
-            "response_format": ["type": "json_object"],
             "temperature": 0.2,
             "max_tokens": 180,
             "stream": false
@@ -291,11 +296,17 @@ final class TiboMonitor {
         guard let json = try? JSONSerialization.data(withJSONObject: body) else {
             completion(.failure(MonitorError.invalidRequest)); return
         }
-        var request = URLRequest(url: deepSeekURL, timeoutInterval: 35)
+        guard let endpoint = OpenAICompatibleEndpoint.url(baseURL: configuration.baseURL,
+                                                          operation: "chat/completions") else {
+            completion(.failure(MonitorError.invalidRequest)); return
+        }
+        var request = URLRequest(url: endpoint, timeoutInterval: 35)
         request.httpMethod = "POST"
         request.httpBody = json
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        if !configuration.apiKey.isEmpty {
+            request.setValue("Bearer \(configuration.apiKey)", forHTTPHeaderField: "Authorization")
+        }
         session.dataTask(with: request) { data, response, error in
             if let error { completion(.failure(error)); return }
             guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode), let data,
@@ -303,8 +314,8 @@ final class TiboMonitor {
                   let choices = root["choices"] as? [[String: Any]],
                   let message = choices.first?["message"] as? [String: Any],
                   let content = message["content"] as? String,
-                  let contentData = content.data(using: .utf8),
-                  let digest = try? JSONDecoder().decode(DeepSeekDigest.self, from: contentData),
+                  let contentData = extractedJSONObject(from: content)?.data(using: .utf8),
+                  let digest = try? JSONDecoder().decode(AIActivityDigest.self, from: contentData),
                   !digest.state.isEmpty, !digest.headline.isEmpty, !digest.summary.isEmpty else {
                 completion(.failure(MonitorError.analysisFailed)); return
             }
@@ -315,7 +326,10 @@ final class TiboMonitor {
     private func finish(_ completion: @escaping (TiboActivitySnapshot) -> Void) {
         running = false
         let value = snapshot
+        let pending = pendingForcedCompletion
+        pendingForcedCompletion = nil
         DispatchQueue.main.async { completion(value) }
+        if let pending { check(forceAnalysis: true, completion: pending) }
     }
 
     private func save() {
@@ -367,4 +381,11 @@ private func limitedText(_ text: String, maximum: Int) -> String {
         .joined(separator: " ")
     guard normalized.count > maximum else { return normalized }
     return String(normalized.prefix(maximum - 1)) + "…"
+}
+
+private func extractedJSONObject(from text: String) -> String? {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.hasPrefix("{") && trimmed.hasSuffix("}") { return trimmed }
+    guard let start = trimmed.firstIndex(of: "{"), let end = trimmed.lastIndex(of: "}"), start < end else { return nil }
+    return String(trimmed[start...end])
 }
