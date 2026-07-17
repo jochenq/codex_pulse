@@ -634,6 +634,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popoverController.onOpenDashboard = { [weak self] in self?.popover.performClose(nil); self?.showStats() }
         popoverController.onOpenTibo = { NSWorkspace.shared.open(URL(string: "https://x.com/thsottiaux")!) }
         popoverController.onConfigureAI = { [weak self] in self?.showAIConfiguration() }
+        popoverController.onRefreshTibo = { [weak self] in self?.refreshTibo(forceAnalysis: true) }
         popoverController.onQuit = { NSApp.terminate(nil) }
         popover = NSPopover()
         popover.behavior = .transient

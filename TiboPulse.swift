@@ -89,7 +89,6 @@ final class TiboMonitor {
                         if self.snapshot.latestPostAt.map({ Date().timeIntervalSince($0) > 14 * 24 * 60 * 60 }) ?? false {
                             self.snapshot.headline = "公开时间线已过期"
                             self.snapshot.summary = "X 返回的公开时间线不是最新内容，已暂停 AI 摘要，等待新数据源恢复。"
-                            self.snapshot.activityState = "等更新"
                             self.snapshot.status = "source-stale"
                         } else {
                             self.snapshot.status = self.snapshot.analyzedAt == nil ? "fetch-error" : "stale"
@@ -268,19 +267,22 @@ final class TiboMonitor {
                     let hasLocationEvidence = digest.locationMode == "inferred"
                         && proposedTimeZone != nil
                         && digest.location?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                    let resolvedTimeZone = hasLocationEvidence ? proposedTimeZone! : TimeZone(identifier: "America/Los_Angeles")!
                     self.snapshot = TiboActivitySnapshot(
                         fingerprint: fingerprint,
-                        headline: limitedText(digest.headline, maximum: 14),
+                        headline: normalizedTiboHeadline(digest.headline),
                         summary: limitedText(digest.summary, maximum: 66),
                         latestPostAt: posts.first?.publishedAt,
                         analyzedAt: Date(), checkedAt: Date(),
                         sourceURL: posts.first?.url ?? self.profileURL.absoluteString,
                         status: "current",
-                        activityState: limitedText(digest.state, maximum: 5),
+                        activityState: normalizedActivityState(digest.state, latestPostAt: posts.first?.publishedAt,
+                                                               timeZone: resolvedTimeZone),
                         inferredLocation: hasLocationEvidence ? limitedText(digest.location!, maximum: 12) : "旧金山湾区",
                         timeZoneIdentifier: hasLocationEvidence ? proposedTimeZone!.identifier : "America/Los_Angeles",
                         locationIsInferred: hasLocationEvidence,
                         avatarURL: posts.compactMap(\.avatarURL).first ?? self.snapshot.avatarURL
+                            ?? "https://pbs.twimg.com/profile_images/2075819673263001600/pj1vyX6I.jpg"
                     )
                 case .failure:
                     self.snapshot.checkedAt = Date()
@@ -301,8 +303,8 @@ final class TiboMonitor {
         let system = """
         你是“Codex 重置之神 Tibo”的公开动态观察员。只根据给出的帖子工作，并遵循以下优先级：
         1. 首要寻找 Codex 用量额度、rate limit、reset、重置窗口、reset card、reset credit、订阅用量恢复等信息。只要存在，就必须放在标题和摘要首句，并写清帖子日期；不得把旧消息说成刚发生。
-        2. 如果没有发现这类信息，标题直接说明“暂无新的 Reset 消息”，不要自行猜测。
-        3. 其他 Codex 产品、模型或团队动态最多用一句话简要概括。
+        2. 如果没有这类信息，不要输出“暂无 Reset 消息”之类的占位结论；标题和摘要应直接概括最近最有价值的其他公开动态。
+        3. 其他 Codex 产品、模型或团队动态用一句话简要概括。
         4. 根据正文、发帖时间与当前时间，粗略推测一个即时状态。state 优先从“工作、开会、发帖、吃饭、休息、睡觉、休假、出行、离线”中选择，不得把 Reset 结论当作人物状态。
         5. 只有帖子明确透露所在地、行程或当地活动时，才推测粗粒度城市/地区及对应 IANA 时区，并令 locationMode 为 inferred；证据不足时必须输出 location="旧金山湾区"、timeZone="America/Los_Angeles"、locationMode="fallback"。不要推断精确地址。
         不使用营销腔；不得在结果中出现“帖子1”“帖子7”之类的内部编号。只输出 JSON，不要 Markdown：{"state":"不超过5个汉字","headline":"不超过14个汉字","summary":"1到2句，不超过66个汉字","location":"城市或地区","timeZone":"IANA时区","locationMode":"inferred或fallback"}。输出前自行检查长度，超出必须压缩。
@@ -415,6 +417,32 @@ private func limitedText(_ text: String, maximum: Int) -> String {
         .joined(separator: " ")
     guard normalized.count > maximum else { return normalized }
     return String(normalized.prefix(maximum - 1)) + "…"
+}
+
+private func normalizedTiboHeadline(_ value: String) -> String {
+    let text = limitedText(value, maximum: 14)
+    let lowered = text.lowercased()
+    if lowered.contains("reset") && (text.contains("暂无") || text.contains("没有") || text.contains("无新")) {
+        return "近期公开动态"
+    }
+    return text
+}
+
+private func normalizedActivityState(_ value: String, latestPostAt: Date?, timeZone: TimeZone) -> String {
+    let mappings = [
+        ("休假", "休假"), ("度假", "休假"), ("睡", "睡觉"), ("吃", "吃饭"),
+        ("用餐", "吃饭"), ("会议", "开会"), ("开会", "开会"), ("出行", "出行"),
+        ("旅行", "出行"), ("发帖", "发帖"), ("工作", "工作"), ("休息", "休息"),
+        ("离线", "离线")
+    ]
+    if let mapped = mappings.first(where: { value.contains($0.0) })?.1 { return mapped }
+    if let latestPostAt, Date().timeIntervalSince(latestPostAt) < 2 * 60 * 60 { return "发帖" }
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = timeZone
+    let hour = calendar.component(.hour, from: Date())
+    if hour < 7 { return "睡觉" }
+    if hour < 19 { return "工作" }
+    return "休息"
 }
 
 private func extractedJSONObject(from text: String) -> String? {
