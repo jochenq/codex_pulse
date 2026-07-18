@@ -27,6 +27,7 @@ final class StatusPopoverController: NSViewController {
     private let updatedLabel = label("", size: 11, color: .tertiaryLabelColor)
     private let tiboHeadline = label("正在获取公开动态", size: 13, weight: .semibold)
     private let tiboSummary = label("首次分析完成后会显示在这里。", size: 11, color: .secondaryLabelColor)
+    private let tiboReply = label("", size: 10, weight: .medium, color: .secondaryLabelColor)
     private let tiboLocalTime = label("旧金山湾区 / PT", size: 10, weight: .medium, color: .secondaryLabelColor)
     private let tiboMeta = label("尚未检查", size: 10, color: .tertiaryLabelColor)
     private let tiboAvatar = NSImageView(image: NSImage(systemSymbolName: "person.crop.circle.fill", accessibilityDescription: "Tibo 头像") ?? NSImage())
@@ -47,7 +48,7 @@ final class StatusPopoverController: NSViewController {
         root.state = .active
         root.translatesAutoresizingMaskIntoConstraints = false
         view = root
-        preferredContentSize = NSSize(width: 398, height: 564)
+        preferredContentSize = NSSize(width: 398, height: 600)
 
         let content = NSStackView()
         content.orientation = .vertical
@@ -59,7 +60,7 @@ final class StatusPopoverController: NSViewController {
             content.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
             content.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
             content.topAnchor.constraint(equalTo: root.topAnchor, constant: 14),
-            content.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -12)
+            content.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -28)
         ])
 
         content.addArrangedSubview(makeHeader())
@@ -69,6 +70,12 @@ final class StatusPopoverController: NSViewController {
         content.addArrangedSubview(makeStatsRow())
         content.addArrangedSubview(makeTiboCard())
         for child in content.arrangedSubviews { child.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true }
+        let versionBadge = makeVersionBadge()
+        root.addSubview(versionBadge)
+        NSLayoutConstraint.activate([
+            versionBadge.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
+            versionBadge.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -6)
+        ])
         let clockTimer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
             guard let self, let snapshot = self.latestTiboSnapshot else { return }
             self.tiboLocalTime.stringValue = tiboPlaceAndTime(snapshot)
@@ -132,6 +139,12 @@ final class StatusPopoverController: NSViewController {
         tiboStateLabel.stringValue = displayTiboState(snapshot)
         tiboHeadline.stringValue = displayTiboHeadline(snapshot.headline)
         tiboSummary.stringValue = snapshot.summary
+        if let reply = snapshot.latestReplyText, !reply.isEmpty {
+            tiboReply.stringValue = "最新回复 · " + reply
+            tiboReply.isHidden = false
+        } else {
+            tiboReply.isHidden = true
+        }
         tiboLocalTime.stringValue = tiboPlaceAndTime(snapshot)
         loadTiboAvatar(snapshot.avatarURL)
         let checked = snapshot.checkedAt == .distantPast ? "尚未检查" : "检查于 \(timeOnly(snapshot.checkedAt))"
@@ -152,7 +165,7 @@ final class StatusPopoverController: NSViewController {
         let row = NSStackView(); row.orientation = .horizontal; row.alignment = .centerY; row.spacing = 10
         let icon = NSImageView(); icon.image = NSWorkspace.shared.icon(forFile: Bundle.main.bundlePath); icon.imageScaling = .scaleProportionallyUpOrDown
         NSLayoutConstraint.activate([icon.widthAnchor.constraint(equalToConstant: 28), icon.heightAnchor.constraint(equalToConstant: 28)])
-        let title = label("Codex Pulse", size: 17, weight: .semibold)
+        let title = label("Codex Pulse", size: 15, weight: .semibold)
         row.addArrangedSubview(icon); row.addArrangedSubview(title); row.addArrangedSubview(NSView()); row.addArrangedSubview(updatedLabel)
         let refresh = RefreshIconButton(target: self, action: #selector(refreshNow))
         refreshButton = refresh
@@ -220,7 +233,7 @@ final class StatusPopoverController: NSViewController {
         let content = NSStackView(); content.orientation = .vertical; content.alignment = .leading; content.spacing = 5; content.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(content)
         NSLayoutConstraint.activate([
-            card.heightAnchor.constraint(equalToConstant: 140),
+            card.heightAnchor.constraint(equalToConstant: 158),
             content.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 13),
             content.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -13),
             content.topAnchor.constraint(equalTo: card.topAnchor, constant: 10),
@@ -257,9 +270,31 @@ final class StatusPopoverController: NSViewController {
         tiboSummary.maximumNumberOfLines = 3
         tiboSummary.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         content.addArrangedSubview(tiboSummary); tiboSummary.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
+        tiboReply.lineBreakMode = .byTruncatingTail
+        content.addArrangedSubview(tiboReply); tiboReply.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
         content.addArrangedSubview(tiboLocalTime)
         content.addArrangedSubview(tiboMeta)
         return card
+    }
+
+    private func makeVersionBadge() -> NSView {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "--"
+        let badge = NSView()
+        badge.translatesAutoresizingMaskIntoConstraints = false
+        badge.wantsLayer = true
+        badge.layer?.backgroundColor = NSColor.tertiaryLabelColor.withAlphaComponent(0.12).cgColor
+        badge.layer?.cornerRadius = 5
+        let text = label("v" + version, size: 8, weight: .medium, color: .tertiaryLabelColor)
+        text.font = .monospacedDigitSystemFont(ofSize: 8, weight: .medium)
+        text.translatesAutoresizingMaskIntoConstraints = false
+        badge.addSubview(text)
+        NSLayoutConstraint.activate([
+            text.leadingAnchor.constraint(equalTo: badge.leadingAnchor, constant: 5),
+            text.trailingAnchor.constraint(equalTo: badge.trailingAnchor, constant: -5),
+            text.topAnchor.constraint(equalTo: badge.topAnchor, constant: 2),
+            text.bottomAnchor.constraint(equalTo: badge.bottomAnchor, constant: -2)
+        ])
+        return badge
     }
 
     private func loadTiboAvatar(_ rawURL: String?) {

@@ -15,13 +15,17 @@ struct TiboActivitySnapshot: Codable {
     var timeZoneIdentifier: String?
     var locationIsInferred: Bool?
     var avatarURL: String?
+    var latestReplyText: String?
+    var latestReplyAt: Date?
+    var latestReplyURL: String?
 
     static func empty() -> TiboActivitySnapshot {
         TiboActivitySnapshot(
             fingerprint: "", headline: "正在获取公开动态", summary: "首次分析完成后会显示在这里。",
             latestPostAt: nil, analyzedAt: nil, checkedAt: .distantPast,
             sourceURL: "https://x.com/thsottiaux", status: "loading", activityState: nil,
-            inferredLocation: nil, timeZoneIdentifier: nil, locationIsInferred: nil, avatarURL: nil
+            inferredLocation: nil, timeZoneIdentifier: nil, locationIsInferred: nil, avatarURL: nil,
+            latestReplyText: nil, latestReplyAt: nil, latestReplyURL: nil
         )
     }
 }
@@ -32,6 +36,7 @@ private struct TiboPost {
     let publishedAt: Date
     let url: String
     let avatarURL: String?
+    let isReply: Bool
 }
 
 private struct AIActivityDigest: Decodable {
@@ -185,7 +190,7 @@ final class TiboMonitor {
             let text = stripHTML(body).trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { continue }
             posts.append(TiboPost(id: id, text: text, publishedAt: date,
-                                  url: "https://x.com/thsottiaux/status/\(id)", avatarURL: avatarURL))
+                                  url: "https://x.com/thsottiaux/status/\(id)", avatarURL: avatarURL, isReply: false))
         }
         let sorted = posts.sorted { $0.publishedAt > $1.publishedAt }
         let substantive = sorted.filter { !$0.text.hasPrefix("@") }
@@ -217,7 +222,8 @@ final class TiboMonitor {
             posts.append(TiboPost(
                 id: id, text: "回复：\(line)", publishedAt: date,
                 url: "https://x.com/thsottiaux/status/\(id)",
-                avatarURL: "https://pbs.twimg.com/profile_images/2075819673263001600/pj1vyX6I.jpg"
+                avatarURL: "https://pbs.twimg.com/profile_images/2075819673263001600/pj1vyX6I.jpg",
+                isReply: true
             ))
             waitingForBody = false
         }
@@ -255,7 +261,7 @@ final class TiboMonitor {
             let user = tweet["user"] as? [String: Any]
             let avatarURL = user?["profile_image_url_https"] as? String ?? firstTiboAvatarURL(in: html)
             posts.append(TiboPost(id: id, text: text, publishedAt: date,
-                                  url: "https://x.com/thsottiaux/status/\(id)", avatarURL: avatarURL))
+                                  url: "https://x.com/thsottiaux/status/\(id)", avatarURL: avatarURL, isReply: false))
         }
         return posts.sorted { $0.publishedAt > $1.publishedAt }.prefix(12).map { $0 }
     }
@@ -292,7 +298,7 @@ final class TiboMonitor {
                   let dateText = metadata["datePublished"], let date = iso.date(from: dateText) else { continue }
             let canonicalURL = "https://x.com/thsottiaux/status/\(id)"
             posts.append(TiboPost(id: id, text: text, publishedAt: date,
-                                  url: canonicalURL, avatarURL: firstTiboAvatarURL(in: html)))
+                                  url: canonicalURL, avatarURL: firstTiboAvatarURL(in: html), isReply: false))
         }
         return posts.sorted { $0.publishedAt > $1.publishedAt }.prefix(8).map { $0 }
     }
@@ -301,6 +307,7 @@ final class TiboMonitor {
                         completion: @escaping (TiboActivitySnapshot) -> Void) {
         let canonical = "tibo-reset-radar-v4\n" + posts.map { "\($0.id)|\(Int($0.publishedAt.timeIntervalSince1970))|\($0.text)" }.joined(separator: "\n")
         let fingerprint = SHA256.hash(data: Data(canonical.utf8)).map { String(format: "%02x", $0) }.joined()
+        let latestReply = posts.first(where: \.isReply)
         let configuration = AIConfigurationStore.shared.load()
         guard configuration.isConfigured else {
             snapshot.checkedAt = Date()
@@ -309,7 +316,8 @@ final class TiboMonitor {
             finish(completion)
             return
         }
-        if !forceAnalysis, fingerprint == snapshot.fingerprint, snapshot.analyzedAt != nil {
+        if !forceAnalysis, fingerprint == snapshot.fingerprint, snapshot.analyzedAt != nil,
+           latestReply?.url == snapshot.latestReplyURL {
             snapshot.checkedAt = Date()
             snapshot.status = "current"
             save()
@@ -338,7 +346,10 @@ final class TiboMonitor {
                         timeZoneIdentifier: hasLocationEvidence ? proposedTimeZone!.identifier : "America/Los_Angeles",
                         locationIsInferred: hasLocationEvidence,
                         avatarURL: posts.compactMap(\.avatarURL).first ?? self.snapshot.avatarURL
-                            ?? "https://pbs.twimg.com/profile_images/2075819673263001600/pj1vyX6I.jpg"
+                            ?? "https://pbs.twimg.com/profile_images/2075819673263001600/pj1vyX6I.jpg",
+                        latestReplyText: latestReply.map { replyDisplayText($0.text) },
+                        latestReplyAt: latestReply?.publishedAt,
+                        latestReplyURL: latestReply?.url
                     )
                 case .failure:
                     self.snapshot.checkedAt = Date()
@@ -361,6 +372,7 @@ final class TiboMonitor {
         1. 首要寻找 Codex 用量额度、rate limit、reset、重置窗口、reset card、reset credit、订阅用量恢复等信息。只要存在，就必须放在标题和摘要首句，并写清帖子日期；不得把旧消息说成刚发生。
         2. 如果没有这类信息，不要输出“暂无 Reset 消息”之类的占位结论；标题和摘要应直接概括最近最有价值的其他公开动态。
         3. 其他 Codex 产品、模型或团队动态用一句话简要概括。
+        评论回复是一级监控内容。最新回复若包含产品计划、时间暗示、承诺或进展，摘要必须提及，不能只概括主帖。
         4. 只有帖子明确透露所在地、行程或当地活动时，才推测粗粒度城市/地区及对应 IANA 时区，并令 locationMode 为 inferred；证据不足时必须输出 location="旧金山湾区"、timeZone="America/Los_Angeles"、locationMode="fallback"。不要推断精确地址。人物状态由应用本地计算，不要输出状态字段。
         不使用营销腔；不得在结果中出现“帖子1”“帖子7”之类的内部编号。只输出 JSON，不要 Markdown：{"headline":"不超过14个汉字","summary":"1到2句，不超过66个汉字","location":"城市或地区","timeZone":"IANA时区","locationMode":"inferred或fallback"}。输出前自行检查长度，超出必须压缩。
         """
@@ -472,6 +484,12 @@ private func limitedText(_ text: String, maximum: Int) -> String {
         .joined(separator: " ")
     guard normalized.count > maximum else { return normalized }
     return String(normalized.prefix(maximum - 1)) + "…"
+}
+
+private func replyDisplayText(_ text: String) -> String {
+    let prefix = "回复："
+    let value = text.hasPrefix(prefix) ? String(text.dropFirst(prefix.count)) : text
+    return limitedText(value, maximum: 48)
 }
 
 private func normalizedTiboHeadline(_ value: String) -> String {
