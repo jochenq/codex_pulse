@@ -45,6 +45,7 @@ private struct AIActivityDigest: Decodable {
 final class TiboMonitor {
     private let profileURL = URL(string: "https://x.com/thsottiaux")!
     private let liveMirrorURL = URL(string: "https://r.jina.ai/http://twstalker.com/thsottiaux")!
+    private let repliesMirrorURL = URL(string: "https://r.jina.ai/https://xcancel.com/thsottiaux/with_replies")!
     private let syndicationURL = URL(string: "https://syndication.twitter.com/srv/timeline-profile/screen-name/thsottiaux")!
     private let queue = DispatchQueue(label: "com.codexpulse.tibo-monitor", qos: .utility)
     private let session: URLSession
@@ -101,6 +102,32 @@ final class TiboMonitor {
     }
 
     private func fetchPosts(completion: @escaping (Result<[TiboPost], Error>) -> Void) {
+        let group = DispatchGroup()
+        var primaryResult: Result<[TiboPost], Error>?
+        var replies: [TiboPost] = []
+        group.enter()
+        fetchPrimaryPosts { result in
+            self.queue.async { primaryResult = result; group.leave() }
+        }
+        group.enter()
+        fetchPage(repliesMirrorURL) { result in
+            self.queue.async {
+                if case .success(let markdown) = result { replies = self.parseReplyPosts(markdown) }
+                group.leave()
+            }
+        }
+        group.notify(queue: queue) {
+            let primary: [TiboPost]
+            if case .success(let posts)? = primaryResult { primary = posts } else { primary = [] }
+            var byID: [String: TiboPost] = [:]
+            for post in primary + replies { byID[post.id] = post }
+            let merged = byID.values.sorted { $0.publishedAt > $1.publishedAt }.prefix(16).map { $0 }
+            if self.isFresh(merged) { completion(.success(merged)) }
+            else { completion(.failure(MonitorError.staleTimeline)) }
+        }
+    }
+
+    private func fetchPrimaryPosts(completion: @escaping (Result<[TiboPost], Error>) -> Void) {
         fetchPage(liveMirrorURL) { mirror in
             if case .success(let html) = mirror {
                 let posts = self.parseLiveMirrorPosts(html)
@@ -130,7 +157,7 @@ final class TiboMonitor {
         request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138 Safari/537.36", forHTTPHeaderField: "User-Agent")
         request.setValue("text/html,application/xhtml+xml", forHTTPHeaderField: "Accept")
         request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
-        if url.host == "r.jina.ai" { request.setValue("html", forHTTPHeaderField: "X-Return-Format") }
+        if url == liveMirrorURL { request.setValue("html", forHTTPHeaderField: "X-Return-Format") }
         session.dataTask(with: request) { data, response, error in
             if let error { completion(.failure(error)); return }
             guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
@@ -164,6 +191,37 @@ final class TiboMonitor {
         let substantive = sorted.filter { !$0.text.hasPrefix("@") }
         let replies = sorted.filter { $0.text.hasPrefix("@") }.prefix(4)
         return Array((substantive + replies).prefix(12)).sorted { $0.publishedAt > $1.publishedAt }
+    }
+
+    private func parseReplyPosts(_ markdown: String) -> [TiboPost] {
+        let statusPrefix = "[](https://xcancel.com/thsottiaux/status/"
+        var currentID: String?
+        var waitingForBody = false
+        var posts: [TiboPost] = []
+        var seen = Set<String>()
+        for rawLine in markdown.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.hasPrefix(statusPrefix), let end = line.range(of: "#m)") {
+                let start = line.index(line.startIndex, offsetBy: statusPrefix.count)
+                let id = String(line[start..<end.lowerBound])
+                currentID = id.allSatisfy(\.isNumber) ? id : nil
+                waitingForBody = false
+                continue
+            }
+            if line.hasPrefix("Replying to ") {
+                waitingForBody = currentID != nil
+                continue
+            }
+            guard waitingForBody, !line.isEmpty, let id = currentID,
+                  seen.insert(id).inserted, let date = dateFromSnowflake(id) else { continue }
+            posts.append(TiboPost(
+                id: id, text: "回复：\(line)", publishedAt: date,
+                url: "https://x.com/thsottiaux/status/\(id)",
+                avatarURL: "https://pbs.twimg.com/profile_images/2075819673263001600/pj1vyX6I.jpg"
+            ))
+            waitingForBody = false
+        }
+        return posts.sorted { $0.publishedAt > $1.publishedAt }.prefix(12).map { $0 }
     }
 
     private func parseSyndicatedPosts(_ html: String) -> [TiboPost] {
