@@ -51,6 +51,7 @@ final class TiboMonitor {
     private let profileURL = URL(string: "https://x.com/thsottiaux")!
     private let liveMirrorURL = URL(string: "https://r.jina.ai/http://twstalker.com/thsottiaux")!
     private let repliesMirrorURL = URL(string: "https://r.jina.ai/https://xcancel.com/thsottiaux/with_replies")!
+    private let mainMirrorURL = URL(string: "https://r.jina.ai/https://xcancel.com/thsottiaux")!
     private let syndicationURL = URL(string: "https://syndication.twitter.com/srv/timeline-profile/screen-name/thsottiaux")!
     private let queue = DispatchQueue(label: "com.codexpulse.tibo-monitor", qos: .utility)
     private let session: URLSession
@@ -110,6 +111,7 @@ final class TiboMonitor {
         let group = DispatchGroup()
         var primaryResult: Result<[TiboPost], Error>?
         var replies: [TiboPost] = []
+        var mainHighlights: [TiboPost] = []
         group.enter()
         fetchPrimaryPosts { result in
             self.queue.async { primaryResult = result; group.leave() }
@@ -121,11 +123,20 @@ final class TiboMonitor {
                 group.leave()
             }
         }
+        group.enter()
+        fetchPage(mainMirrorURL) { result in
+            self.queue.async {
+                if case .success(let markdown) = result { mainHighlights = self.parseMainResetHighlights(markdown) }
+                group.leave()
+            }
+        }
         group.notify(queue: queue) {
             let primary: [TiboPost]
             if case .success(let posts)? = primaryResult { primary = posts } else { primary = [] }
+            let formalTexts = Set((primary + replies).map { $0.text.lowercased() })
+            let uniqueHighlights = mainHighlights.filter { !formalTexts.contains($0.text.lowercased()) }
             var byID: [String: TiboPost] = [:]
-            for post in primary + replies { byID[post.id] = post }
+            for post in primary + replies + uniqueHighlights { byID[post.id] = post }
             let merged = byID.values.sorted { $0.publishedAt > $1.publishedAt }.prefix(16).map { $0 }
             if self.isFresh(merged) { completion(.success(merged)) }
             else { completion(.failure(MonitorError.staleTimeline)) }
@@ -230,6 +241,31 @@ final class TiboMonitor {
         return posts.sorted { $0.publishedAt > $1.publishedAt }.prefix(12).map { $0 }
     }
 
+    private func parseMainResetHighlights(_ markdown: String) -> [TiboPost] {
+        guard let marker = markdown.range(of: "Markdown Content:") else { return [] }
+        let lines = markdown[marker.upperBound...].components(separatedBy: .newlines).prefix(70)
+        var seen = Set<String>()
+        var posts: [TiboPost] = []
+        for rawLine in lines {
+            let text = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            let lowered = text.lowercased()
+            guard text.count >= 20, !text.hasPrefix("["),
+                  lowered.contains("reset"),
+                  lowered.contains("limit") || lowered.contains("usage") || lowered.contains("rate") else { continue }
+            let digest = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+            guard seen.insert(digest).inserted else { continue }
+            posts.append(TiboPost(
+                id: "xcancel-main-" + String(digest.prefix(20)), text: text,
+                publishedAt: Date().addingTimeInterval(-Double(posts.count)),
+                url: profileURL.absoluteString,
+                avatarURL: "https://pbs.twimg.com/profile_images/2075819673263001600/pj1vyX6I.jpg",
+                isReply: false
+            ))
+            if posts.count == 3 { break }
+        }
+        return posts
+    }
+
     private func parseSyndicatedPosts(_ html: String) -> [TiboPost] {
         guard let regex = try? NSRegularExpression(
             pattern: #"<script[^>]*id=\"__NEXT_DATA__\"[^>]*>(.*?)</script>"#,
@@ -305,7 +341,7 @@ final class TiboMonitor {
 
     private func handle(posts: [TiboPost], forceAnalysis: Bool,
                         completion: @escaping (TiboActivitySnapshot) -> Void) {
-        let canonical = "tibo-reset-radar-v4\n" + posts.map { "\($0.id)|\(Int($0.publishedAt.timeIntervalSince1970))|\($0.text)" }.joined(separator: "\n")
+        let canonical = "tibo-reset-radar-v5\n" + posts.map { "\($0.id)|\($0.text)" }.joined(separator: "\n")
         let fingerprint = SHA256.hash(data: Data(canonical.utf8)).map { String(format: "%02x", $0) }.joined()
         let latestReply = posts.first(where: \.isReply)
         let configuration = AIConfigurationStore.shared.load()
