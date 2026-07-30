@@ -106,8 +106,7 @@ final class StatusPopoverController: NSViewController {
         let mainUsed = snapshot?.secondaryUsed ?? snapshot?.primaryUsed
         let mainMinutes = snapshot?.secondaryUsed != nil ? snapshot?.secondaryMinutes : snapshot?.primaryMinutes
         let mainReset = snapshot?.secondaryUsed != nil ? snapshot?.secondaryReset : snapshot?.primaryReset
-        let remaining = max(0, 100 - (mainUsed ?? 0))
-        ring.remaining = snapshot == nil ? nil : remaining
+        ring.remaining = mainUsed.map { max(0, 100 - $0) }
         windowTitle.stringValue = windowName(mainMinutes)
         quotaDetail.stringValue = mainUsed.map { "已用 \($0)%  ·  剩余 \(max(0, 100 - $0))%" } ?? "额度暂时无法读取"
         progress.usedPercent = mainUsed

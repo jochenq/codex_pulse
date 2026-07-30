@@ -501,6 +501,9 @@ final class RateLimitReader {
     private var resetCreditCache: ResetCreditInfo?
     private let resetCreditCacheKey = "codex-pulse-reset-credit-cache-v1"
     private var usageCache: (snapshot: Snapshot, fetchedAt: Date)?
+    private let usageCacheKey = "codex-pulse-usage-cache-v1"
+    private let usageRefreshLock = NSLock()
+    private var usageRefreshInFlight = false
 
     struct Snapshot {
         var primaryUsed: Int?
@@ -578,6 +581,9 @@ final class RateLimitReader {
             let snapshot = stateQueue.sync { decoded }
             if process.isRunning { process.terminate() }
             try? input.fileHandleForWriting.close()
+            if let snapshot, snapshot.primaryUsed != nil || snapshot.secondaryUsed != nil {
+                self.saveUsage(snapshot)
+            }
             self.complete(snapshot: snapshot, completion: completion)
         }
     }
@@ -607,9 +613,29 @@ final class RateLimitReader {
     }
 
     private func readUsageDirect() -> Snapshot? {
-        if let cached = usageCache, Date().timeIntervalSince(cached.fetchedAt) < 90 {
-            return cached.snapshot
+        if let cached = cachedUsage(maxAge: 90) { return cached }
+        if let cached = cachedUsage(maxAge: 30 * 60) {
+            refreshUsageInBackground()
+            return cached
         }
+        return fetchUsageSnapshot()
+    }
+
+    private func refreshUsageInBackground() {
+        usageRefreshLock.lock()
+        guard !usageRefreshInFlight else { usageRefreshLock.unlock(); return }
+        usageRefreshInFlight = true
+        usageRefreshLock.unlock()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            _ = self.fetchUsageSnapshot()
+            self.usageRefreshLock.lock()
+            self.usageRefreshInFlight = false
+            self.usageRefreshLock.unlock()
+        }
+    }
+
+    private func fetchUsageSnapshot() -> Snapshot? {
         guard let root = authenticatedJSON(endpoint: "/backend-api/codex/usage", timeout: 20),
               let rateLimit = (root["rate_limit"] ?? root["rateLimit"]) as? [String: Any] else { return nil }
         let primary = (rateLimit["primary_window"] ?? rateLimit["primaryWindow"]) as? [String: Any]
@@ -631,8 +657,49 @@ final class RateLimitReader {
             resetCreditExpiry: resetExpiry
         )
         guard snapshot.primaryUsed != nil || snapshot.secondaryUsed != nil else { return nil }
-        usageCache = (snapshot, Date())
+        saveUsage(snapshot)
         return snapshot
+    }
+
+    private func cachedUsage(maxAge: TimeInterval) -> Snapshot? {
+        if usageCache == nil,
+           let saved = UserDefaults.standard.dictionary(forKey: usageCacheKey),
+           let fetchedAt = dateValue(saved["fetchedAt"]) {
+            usageCache = (
+                Snapshot(
+                    primaryUsed: intOptional(saved["primaryUsed"]),
+                    primaryMinutes: intOptional(saved["primaryMinutes"]),
+                    primaryReset: dateValue(saved["primaryReset"]),
+                    secondaryUsed: intOptional(saved["secondaryUsed"]),
+                    secondaryMinutes: intOptional(saved["secondaryMinutes"]),
+                    secondaryReset: dateValue(saved["secondaryReset"]),
+                    plan: saved["plan"] as? String,
+                    credits: doubleOptional(saved["credits"]),
+                    resetCreditCount: nil,
+                    resetCreditExpiry: nil
+                ),
+                fetchedAt
+            )
+        }
+        guard let cached = usageCache,
+              Date().timeIntervalSince(cached.fetchedAt) <= maxAge,
+              cached.snapshot.primaryUsed != nil || cached.snapshot.secondaryUsed != nil else { return nil }
+        return cached.snapshot
+    }
+
+    private func saveUsage(_ snapshot: Snapshot) {
+        let fetchedAt = Date()
+        usageCache = (snapshot, fetchedAt)
+        var saved: [String: Any] = ["fetchedAt": fetchedAt.timeIntervalSince1970]
+        if let value = snapshot.primaryUsed { saved["primaryUsed"] = value }
+        if let value = snapshot.primaryMinutes { saved["primaryMinutes"] = value }
+        if let value = snapshot.primaryReset { saved["primaryReset"] = value.timeIntervalSince1970 }
+        if let value = snapshot.secondaryUsed { saved["secondaryUsed"] = value }
+        if let value = snapshot.secondaryMinutes { saved["secondaryMinutes"] = value }
+        if let value = snapshot.secondaryReset { saved["secondaryReset"] = value.timeIntervalSince1970 }
+        if let value = snapshot.plan { saved["plan"] = value }
+        if let value = snapshot.credits { saved["credits"] = value }
+        UserDefaults.standard.set(saved, forKey: usageCacheKey)
     }
 
     private func readResetCredits(completion: @escaping (ResetCreditInfo?) -> Void) {
