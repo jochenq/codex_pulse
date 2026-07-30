@@ -492,6 +492,16 @@ final class MetricStore {
 }
 
 final class RateLimitReader {
+    private struct ResetCreditInfo {
+        let count: Int
+        let expiry: Date?
+        let fetchedAt: Date
+    }
+
+    private var resetCreditCache: ResetCreditInfo?
+    private let resetCreditCacheKey = "codex-pulse-reset-credit-cache-v1"
+    private var usageCache: (snapshot: Snapshot, fetchedAt: Date)?
+
     struct Snapshot {
         var primaryUsed: Int?
         var primaryMinutes: Int?
@@ -507,6 +517,10 @@ final class RateLimitReader {
 
     func read(completion: @escaping (Snapshot?) -> Void) {
         DispatchQueue.global(qos: .utility).async {
+            if let snapshot = self.readUsageDirect() {
+                self.complete(snapshot: snapshot, completion: completion)
+                return
+            }
             let paths = [
                 "/Applications/ChatGPT.app/Contents/Resources/codex",
                 "/opt/homebrew/bin/codex",
@@ -516,12 +530,12 @@ final class RateLimitReader {
                 completion(nil); return
             }
             let process = Process()
-            let input = Pipe(), output = Pipe(), error = Pipe()
+            let input = Pipe(), output = Pipe()
             process.executableURL = URL(fileURLWithPath: path)
             process.arguments = ["app-server", "--stdio"]
             process.standardInput = input
             process.standardOutput = output
-            process.standardError = error
+            process.standardError = FileHandle.nullDevice
             do { try process.run() } catch { completion(nil); return }
 
             let messages: [[String: Any]] = [
@@ -532,7 +546,7 @@ final class RateLimitReader {
                         "clientInfo": [
                             "name": "codex_pulse_monitor",
                             "title": "Codex Pulse Monitor",
-                            "version": "2.10.5"
+                            "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
                         ]
                     ]
                 ],
@@ -559,21 +573,165 @@ final class RateLimitReader {
                     }
                 }
             }
-            _ = response.wait(timeout: .now() + 12)
+            _ = response.wait(timeout: .now() + 20)
             output.fileHandleForReading.readabilityHandler = nil
             let snapshot = stateQueue.sync { decoded }
             if process.isRunning { process.terminate() }
             try? input.fileHandleForWriting.close()
-            completion(snapshot)
+            self.complete(snapshot: snapshot, completion: completion)
         }
+    }
+
+    private func complete(snapshot: Snapshot?, completion: @escaping (Snapshot?) -> Void) {
+        if let snapshot, let count = snapshot.resetCreditCount,
+           count == 0 || snapshot.resetCreditExpiry != nil {
+            completion(snapshot)
+            return
+        }
+        readResetCredits { resetInfo in
+            guard snapshot != nil || resetInfo != nil else {
+                completion(nil)
+                return
+            }
+            var merged = snapshot ?? Snapshot(
+                primaryUsed: nil, primaryMinutes: nil, primaryReset: nil,
+                secondaryUsed: nil, secondaryMinutes: nil, secondaryReset: nil,
+                plan: nil, credits: nil, resetCreditCount: nil, resetCreditExpiry: nil
+            )
+            if let resetInfo {
+                merged.resetCreditCount = resetInfo.count
+                merged.resetCreditExpiry = resetInfo.expiry
+            }
+            completion(merged)
+        }
+    }
+
+    private func readUsageDirect() -> Snapshot? {
+        if let cached = usageCache, Date().timeIntervalSince(cached.fetchedAt) < 90 {
+            return cached.snapshot
+        }
+        guard let root = authenticatedJSON(endpoint: "/backend-api/codex/usage", timeout: 20),
+              let rateLimit = (root["rate_limit"] ?? root["rateLimit"]) as? [String: Any] else { return nil }
+        let primary = (rateLimit["primary_window"] ?? rateLimit["primaryWindow"]) as? [String: Any]
+        let secondary = (rateLimit["secondary_window"] ?? rateLimit["secondaryWindow"]) as? [String: Any]
+        let credits = root["credits"] as? [String: Any]
+        let resetSummary = (root["rate_limit_reset_credits"] ?? root["rateLimitResetCredits"]) as? [String: Any]
+        let resetCredits = resetSummary?["credits"] as? [[String: Any]]
+        let resetExpiry = resetCredits?.compactMap { dateValue($0["expires_at"] ?? $0["expiresAt"]) }.min()
+        let snapshot = Snapshot(
+            primaryUsed: intOptional(primary?["used_percent"] ?? primary?["usedPercent"]),
+            primaryMinutes: durationMinutes(primary?["limit_window_seconds"] ?? primary?["limitWindowSeconds"]),
+            primaryReset: dateValue(primary?["reset_at"] ?? primary?["resetAt"]),
+            secondaryUsed: intOptional(secondary?["used_percent"] ?? secondary?["usedPercent"]),
+            secondaryMinutes: durationMinutes(secondary?["limit_window_seconds"] ?? secondary?["limitWindowSeconds"]),
+            secondaryReset: dateValue(secondary?["reset_at"] ?? secondary?["resetAt"]),
+            plan: (root["plan_type"] ?? root["planType"]) as? String,
+            credits: doubleOptional(credits?["balance"]),
+            resetCreditCount: intOptional(resetSummary?["available_count"] ?? resetSummary?["availableCount"]),
+            resetCreditExpiry: resetExpiry
+        )
+        guard snapshot.primaryUsed != nil || snapshot.secondaryUsed != nil else { return nil }
+        usageCache = (snapshot, Date())
+        return snapshot
+    }
+
+    private func readResetCredits(completion: @escaping (ResetCreditInfo?) -> Void) {
+        if let cached = cachedResetCredits(maxAge: 5 * 60) {
+            completion(cached)
+            return
+        }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { completion(nil); return }
+            guard let root = self.authenticatedJSON(endpoint: "/backend-api/codex/rate-limit-reset-credits", timeout: 20) else {
+                completion(self.cachedResetCredits(maxAge: 30 * 60))
+                return
+            }
+            let credits = (root["credits"] as? [[String: Any]] ?? []).filter {
+                ($0["status"] as? String)?.lowercased() == "available"
+                    && ($0["is_supported_by_plan"] as? Bool ?? true)
+            }
+            let count = intOptional(root["available_count"] ?? root["availableCount"]) ?? credits.count
+            let expiry = credits.compactMap { dateValue($0["expires_at"] ?? $0["expiresAt"]) }.min()
+            let info = ResetCreditInfo(count: count, expiry: expiry, fetchedAt: Date())
+            self.saveResetCredits(info)
+            completion(info)
+        }
+    }
+
+    private func authenticatedJSON(endpoint: String, timeout: Int) -> [String: Any]? {
+        let authURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/auth.json")
+        guard let authData = try? Data(contentsOf: authURL),
+              let auth = try? JSONSerialization.jsonObject(with: authData) as? [String: Any],
+              let tokens = auth["tokens"] as? [String: Any],
+              let accessToken = tokens["access_token"] as? String, !accessToken.isEmpty,
+              let accountID = tokens["account_id"] as? String, !accountID.isEmpty else { return nil }
+        let process = Process()
+        let input = Pipe(), output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        process.arguments = [
+            "--http1.1", "--silent", "--show-error", "--fail-with-body",
+            "--max-time", "\(timeout)", "--config", "-", "https://chatgpt.com\(endpoint)"
+        ]
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+            let configuration = """
+            header = "Authorization: Bearer \(accessToken)"
+            header = "ChatGPT-Account-Id: \(accountID)"
+            header = "Accept: application/json"
+            user-agent = "Codex Pulse/\(version)"
+
+            """
+            input.fileHandleForWriting.write(Data(configuration.utf8))
+            try? input.fileHandleForWriting.close()
+        } catch { return nil }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
+        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    }
+
+    private func cachedResetCredits(maxAge: TimeInterval) -> ResetCreditInfo? {
+        if resetCreditCache == nil,
+           let saved = UserDefaults.standard.dictionary(forKey: resetCreditCacheKey),
+           let count = intOptional(saved["count"]),
+           let fetchedAt = dateValue(saved["fetchedAt"]) {
+            resetCreditCache = ResetCreditInfo(
+                count: count,
+                expiry: dateValue(saved["expiry"]),
+                fetchedAt: fetchedAt
+            )
+        }
+        guard let cached = resetCreditCache,
+              Date().timeIntervalSince(cached.fetchedAt) <= maxAge else { return nil }
+        return cached
+    }
+
+    private func saveResetCredits(_ info: ResetCreditInfo) {
+        resetCreditCache = info
+        var saved: [String: Any] = [
+            "count": info.count,
+            "fetchedAt": info.fetchedAt.timeIntervalSince1970
+        ]
+        if let expiry = info.expiry { saved["expiry"] = expiry.timeIntervalSince1970 }
+        UserDefaults.standard.set(saved, forKey: resetCreditCacheKey)
     }
 
     private func decode(_ data: Data) -> Snapshot? {
         for line in String(decoding: data, as: UTF8.self).split(separator: "\n") {
             guard let bytes = line.data(using: .utf8),
                   let root = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any],
-                  let result = root["result"] as? [String: Any],
-                  let limits = result["rateLimits"] as? [String: Any] else { continue }
+                  let result = root["result"] as? [String: Any] else { continue }
+            let limitsByID = result["rateLimitsByLimitId"] as? [String: Any]
+            let limits = result["rateLimits"] as? [String: Any]
+                ?? limitsByID?["codex"] as? [String: Any]
+                ?? limitsByID?.values.compactMap { $0 as? [String: Any] }.first(where: {
+                    ($0["limitId"] ?? $0["limit_id"]) as? String == "codex"
+                })
+            guard let limits else { continue }
             let primary = limits["primary"] as? [String: Any]
             let secondary = limits["secondary"] as? [String: Any]
             let credits = limits["credits"] as? [String: Any]
@@ -854,8 +1012,14 @@ private func doubleOptional(_ value: Any?) -> Double? {
 }
 
 private func dateValue(_ value: Any?) -> Date? {
-    guard let seconds = doubleOptional(value) else { return nil }
-    return Date(timeIntervalSince1970: seconds)
+    if let seconds = doubleOptional(value) { return Date(timeIntervalSince1970: seconds) }
+    guard let value = value as? String else { return nil }
+    return isoFormatter.date(from: value) ?? plainISOFormatter.date(from: value)
+}
+
+private func durationMinutes(_ value: Any?) -> Int? {
+    guard let seconds = intOptional(value) else { return nil }
+    return max(1, seconds / 60)
 }
 
 func compactNumber(_ value: Int) -> String {
