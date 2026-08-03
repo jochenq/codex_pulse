@@ -329,6 +329,16 @@ final class StatusPopoverController: NSViewController {
         }
     }
 
+    func noteRefreshRequested() {
+        refreshButton?.flash()
+        updatedLabel.stringValue = "正在刷新…"
+    }
+
+    func noteRefreshQueued() {
+        refreshButton?.flash()
+        updatedLabel.stringValue = "刷新已排队…"
+    }
+
     @objc private func refreshNow() { onRefresh?() }
     @objc private func openDashboard() { onOpenDashboard?() }
     @objc private func openTibo() { onOpenTibo?() }
@@ -373,12 +383,14 @@ private final class RefreshIconButton: NSButton {
         self.action = action
         title = ""
         isBordered = false
+        setButtonType(.momentaryPushIn)
+        sendAction(on: [.leftMouseDown])
         toolTip = "立即刷新"
         setAccessibilityLabel("刷新用量和 Tibo 动态")
         translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            widthAnchor.constraint(equalToConstant: 24),
-            heightAnchor.constraint(equalToConstant: 24)
+            widthAnchor.constraint(equalToConstant: 34),
+            heightAnchor.constraint(equalToConstant: 34)
         ])
 
         glyph.image = NSImage(systemSymbolName: "arrow.triangle.2.circlepath.circle", accessibilityDescription: "立即刷新")
@@ -425,6 +437,17 @@ private final class RefreshIconButton: NSButton {
             glyph.isHidden = false
         }
     }
+
+    func flash() {
+        guard !spinning else { return }
+        glyph.contentTintColor = .controlAccentColor
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self, !self.spinning else { return }
+            self.glyph.contentTintColor = .secondaryLabelColor
+        }
+    }
+
+    private var spinning: Bool { !spinner.isDisplayedWhenStopped && glyph.isHidden }
 }
 
 private final class QuotaProgressView: NSView {

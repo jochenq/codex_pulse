@@ -836,6 +836,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var tiboTimer: Timer?
     private var liveTimer: Timer?
     private var isRefreshing = false
+    private var queuedManualRefresh = false
     private var isLivePolling = false
     private let storeQueue = DispatchQueue(label: "com.codexpulse.metric-store", qos: .utility)
     private var statsController: StatsWindowController?
@@ -916,8 +917,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func manualRefresh() {
+        popoverController.noteRefreshRequested()
         refreshTibo(forceAnalysis: true)
-        refresh()
+        refresh(force: true)
     }
 
     private func installEditMenu() {
@@ -935,8 +937,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.mainMenu = mainMenu
     }
 
-    @objc private func refresh() {
-        guard !isRefreshing else { return }
+    private func refresh(force: Bool = false) {
+        if isRefreshing {
+            if force {
+                queuedManualRefresh = true
+                popoverController.noteRefreshQueued()
+            }
+            return
+        }
         isRefreshing = true
         popoverController.setRefreshing(true)
         if !hasLoadedOnce {
@@ -946,14 +954,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         storeQueue.async { [weak self] in
             guard let self else { return }
             _ = self.store.importCodexHistory()
-            self.rateReader.read(force: true) { snapshot in
+            self.rateReader.read(force: force) { snapshot in
                 DispatchQueue.main.async {
                     self.snapshot = snapshot ?? self.snapshot
                     self.isRefreshing = false
                     self.hasLoadedOnce = true
                     self.updateUI()
+                    let shouldRefreshAgain = self.queuedManualRefresh
+                    self.queuedManualRefresh = false
                     if CommandLine.arguments.contains("--show-popover"), !self.popover.isShown {
                         self.togglePopover()
+                    }
+                    if shouldRefreshAgain {
+                        self.refresh(force: true)
                     }
                 }
             }
