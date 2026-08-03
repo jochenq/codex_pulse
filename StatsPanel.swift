@@ -61,8 +61,8 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
     private let consoleStatusLabel = NSTextField(labelWithString: "")
     private var chartHeightConstraint: NSLayoutConstraint?
     private let consolePageLabel = NSTextField(labelWithString: "")
-    private lazy var previousPageButton = NSButton(title: "‹ 上一页", target: self, action: #selector(previousConsolePage))
-    private lazy var nextPageButton = NSButton(title: "下一页 ›", target: self, action: #selector(nextConsolePage))
+    private lazy var previousPageButton = ClickableButton(title: "‹ 上一页", target: self, action: #selector(previousConsolePage))
+    private lazy var nextPageButton = ClickableButton(title: "下一页 ›", target: self, action: #selector(nextConsolePage))
     private let consolePageSize = 100
     private var consolePage = 0
 

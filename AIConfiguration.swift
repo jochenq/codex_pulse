@@ -163,7 +163,7 @@ final class AIConfigurationWindowController: NSWindowController, NSWindowDelegat
     private let apiKeyField = NSSecureTextField()
     private let modelCombo = NSComboBox()
     private let statusLabel = NSTextField(labelWithString: "")
-    private let fetchButton = NSButton(title: "获取模型", target: nil, action: nil)
+    private let fetchButton = ClickableButton(title: "获取模型", target: nil, action: nil)
 
     init(onSave: ((AIServiceConfiguration) -> Void)? = nil) {
         self.onSave = onSave
@@ -213,9 +213,9 @@ final class AIConfigurationWindowController: NSWindowController, NSWindowDelegat
         fetchButton.target = self
         fetchButton.action = #selector(fetchModels)
         fetchButton.bezelStyle = .rounded
-        let cancel = NSButton(title: "取消", target: self, action: #selector(cancel))
+        let cancel = ClickableButton(title: "取消", target: self, action: #selector(cancel))
         cancel.bezelStyle = .rounded
-        let save = NSButton(title: "保存配置", target: self, action: #selector(saveConfiguration))
+        let save = ClickableButton(title: "保存配置", target: self, action: #selector(saveConfiguration))
         save.bezelStyle = .rounded
         save.keyEquivalent = "\r"
         statusLabel.font = .systemFont(ofSize: 11)

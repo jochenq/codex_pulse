@@ -518,9 +518,9 @@ final class RateLimitReader {
         var resetCreditExpiry: Date?
     }
 
-    func read(completion: @escaping (Snapshot?) -> Void) {
+    func read(force: Bool = false, completion: @escaping (Snapshot?) -> Void) {
         DispatchQueue.global(qos: .utility).async {
-            if let snapshot = self.readUsageDirect() {
+            if let snapshot = self.readUsageDirect(force: force) {
                 self.complete(snapshot: snapshot, completion: completion)
                 return
             }
@@ -612,7 +612,10 @@ final class RateLimitReader {
         }
     }
 
-    private func readUsageDirect() -> Snapshot? {
+    private func readUsageDirect(force: Bool = false) -> Snapshot? {
+        if force {
+            return fetchUsageSnapshot() ?? cachedUsage(maxAge: 30 * 60)
+        }
         if let cached = cachedUsage(maxAge: 90) { return cached }
         if let cached = cachedUsage(maxAge: 30 * 60) {
             refreshUsageInBackground()
@@ -943,7 +946,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         storeQueue.async { [weak self] in
             guard let self else { return }
             _ = self.store.importCodexHistory()
-            self.rateReader.read { snapshot in
+            self.rateReader.read(force: true) { snapshot in
                 DispatchQueue.main.async {
                     self.snapshot = snapshot ?? self.snapshot
                     self.isRefreshing = false

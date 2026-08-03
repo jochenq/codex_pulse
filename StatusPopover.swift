@@ -256,7 +256,7 @@ final class StatusPopoverController: NSViewController {
         refresh.contentTintColor = .secondaryLabelColor
         header.addArrangedSubview(refresh)
         header.addArrangedSubview(NSView())
-        let source = NSButton(title: "查看", target: self, action: #selector(openTibo))
+        let source = ClickableButton(title: "查看", target: self, action: #selector(openTibo))
         source.image = xBrandIcon()
         source.imagePosition = .imageRight
         source.imageHugsTitle = true
@@ -317,7 +317,7 @@ final class StatusPopoverController: NSViewController {
     }
 
     private func iconButton(_ symbol: String, toolTip: String, action: Selector) -> NSButton {
-        let button = NSButton(image: NSImage(systemSymbolName: symbol, accessibilityDescription: toolTip) ?? NSImage(), target: self, action: action)
+        let button = ClickableButton(image: NSImage(systemSymbolName: symbol, accessibilityDescription: toolTip) ?? NSImage(), target: self, action: action)
         button.isBordered = false; button.toolTip = toolTip; button.contentTintColor = .secondaryLabelColor; return button
     }
 
@@ -355,6 +355,12 @@ private final class TiboActivityCardView: NSView {
         layer?.borderWidth = 1
     }
     required init?(coder: NSCoder) { nil }
+}
+
+final class ClickableButton: NSButton {
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
 }
 
 private final class RefreshIconButton: NSButton {
@@ -404,6 +410,10 @@ private final class RefreshIconButton: NSButton {
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         bounds.contains(point) ? self : nil
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
     }
 
     func setSpinning(_ spinning: Bool) {
