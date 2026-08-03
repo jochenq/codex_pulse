@@ -324,6 +324,9 @@ final class StatusPopoverController: NSViewController {
     func setRefreshing(_ value: Bool) {
         refreshing = value
         refreshButton?.setSpinning(value)
+        if value {
+            updatedLabel.stringValue = "刷新中…"
+        }
     }
 
     @objc private func refreshNow() { onRefresh?() }
@@ -365,6 +368,7 @@ private final class RefreshIconButton: NSButton {
         title = ""
         isBordered = false
         toolTip = "立即刷新"
+        setAccessibilityLabel("刷新用量和 Tibo 动态")
         translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             widthAnchor.constraint(equalToConstant: 24),
