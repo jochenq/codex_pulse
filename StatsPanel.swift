@@ -919,10 +919,10 @@ private func apiPrice(for rawModel: String) -> APIPrice? {
         return APIPrice(name: "GPT-5.6 Sol", input: 5, cached: 0.5, output: 30)
     }
     if matchesModel(model, "gpt-5.6-terra") {
-        return APIPrice(name: "GPT-5.6 Terra", input: 2.5, cached: 0.25, output: 15)
+        return APIPrice(name: "GPT-5.6 Terra", input: 2, cached: 0.2, output: 12)
     }
     if matchesModel(model, "gpt-5.6-luna") {
-        return APIPrice(name: "GPT-5.6 Luna", input: 1, cached: 0.1, output: 6)
+        return APIPrice(name: "GPT-5.6 Luna", input: 0.2, cached: 0.02, output: 1.2)
     }
     if matchesModel(model, "gpt-5.5-pro") {
         return APIPrice(name: "GPT-5.5 Pro", input: 30, cached: 30, output: 180)
@@ -932,6 +932,12 @@ private func apiPrice(for rawModel: String) -> APIPrice? {
     }
     if matchesModel(model, "gpt-5.4-pro") {
         return APIPrice(name: "GPT-5.4 Pro", input: 30, cached: 30, output: 180)
+    }
+    if matchesModel(model, "gpt-5.4-mini") {
+        return APIPrice(name: "GPT-5.4 Mini", input: 0.75, cached: 0.075, output: 4.5)
+    }
+    if matchesModel(model, "gpt-5.4-nano") {
+        return APIPrice(name: "GPT-5.4 Nano", input: 0.2, cached: 0.02, output: 1.25)
     }
     if matchesModel(model, "gpt-5.4") {
         return APIPrice(name: "GPT-5.4", input: 2.5, cached: 0.25, output: 15)
