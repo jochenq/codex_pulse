@@ -367,13 +367,40 @@ private final class TiboActivityCardView: NSView {
     required init?(coder: NSCoder) { nil }
 }
 
-final class ClickableButton: NSButton {
+class ClickableButton: NSButton {
+    private var handTrackingArea: NSTrackingArea?
+
     override func resetCursorRects() {
-        addCursorRect(bounds, cursor: .pointingHand)
+        addCursorRect(bounds.insetBy(dx: -3, dy: -3), cursor: .pointingHand)
+    }
+
+    override func updateTrackingAreas() {
+        if let handTrackingArea {
+            removeTrackingArea(handTrackingArea)
+        }
+        let options: NSTrackingArea.Options = [.activeAlways, .mouseEnteredAndExited, .inVisibleRect]
+        let area = NSTrackingArea(rect: bounds, options: options, owner: self, userInfo: nil)
+        handTrackingArea = area
+        addTrackingArea(area)
+        super.updateTrackingAreas()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        NSCursor.pointingHand.set()
+        super.mouseEntered(with: event)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        NSCursor.arrow.set()
+        super.mouseExited(with: event)
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
     }
 }
 
-private final class RefreshIconButton: NSButton {
+private final class RefreshIconButton: ClickableButton {
     private let glyph = NSImageView()
     private let spinner = NSProgressIndicator()
 
@@ -422,10 +449,6 @@ private final class RefreshIconButton: NSButton {
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         bounds.contains(point) ? self : nil
-    }
-
-    override func resetCursorRects() {
-        addCursorRect(bounds, cursor: .pointingHand)
     }
 
     func setSpinning(_ spinning: Bool) {
