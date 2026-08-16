@@ -151,6 +151,8 @@ final class StatusPopoverController: NSViewController {
         switch snapshot.status {
         case "current":
             tiboMeta.stringValue = checked + latest
+        case "current-fallback":
+            tiboMeta.stringValue = "自动摘要 · " + checked + latest
         case "loading":
             tiboMeta.stringValue = "正在更新 Tibo 动态…"
         case "missing-configuration":

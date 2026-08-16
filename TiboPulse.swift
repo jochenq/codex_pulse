@@ -52,6 +52,11 @@ final class TiboMonitor {
     private let liveMirrorURL = URL(string: "https://r.jina.ai/http://twstalker.com/thsottiaux")!
     private let repliesMirrorURL = URL(string: "https://r.jina.ai/https://xcancel.com/thsottiaux/with_replies")!
     private let mainMirrorURL = URL(string: "https://r.jina.ai/https://xcancel.com/thsottiaux")!
+    // Jina's anonymous mirror can be unavailable or rate-limited. Keep direct
+    // xcancel endpoints as a parser-compatible fallback instead of treating a
+    // temporary proxy failure as an empty timeline.
+    private let directTimelineURL = URL(string: "https://xcancel.com/thsottiaux")!
+    private let directRepliesURL = URL(string: "https://xcancel.com/thsottiaux/with_replies")!
     private let syndicationURL = URL(string: "https://syndication.twitter.com/srv/timeline-profile/screen-name/thsottiaux")!
     private let queue = DispatchQueue(label: "com.codexpulse.tibo-monitor", qos: .utility)
     private let session: URLSession
@@ -117,18 +122,12 @@ final class TiboMonitor {
             self.queue.async { primaryResult = result; group.leave() }
         }
         group.enter()
-        fetchPage(repliesMirrorURL) { result in
-            self.queue.async {
-                if case .success(let markdown) = result { replies = self.parseReplyPosts(markdown) }
-                group.leave()
-            }
+        fetchReplies { result in
+            self.queue.async { replies = result; group.leave() }
         }
         group.enter()
-        fetchPage(mainMirrorURL) { result in
-            self.queue.async {
-                if case .success(let markdown) = result { mainHighlights = self.parseMainResetHighlights(markdown) }
-                group.leave()
-            }
+        fetchMainHighlights { result in
+            self.queue.async { mainHighlights = result; group.leave() }
         }
         group.notify(queue: queue) {
             let primary: [TiboPost]
@@ -149,21 +148,63 @@ final class TiboMonitor {
                 let posts = self.parseLiveMirrorPosts(html)
                 if self.isFresh(posts) { completion(.success(posts)); return }
             }
-            self.fetchPage(self.syndicationURL) { result in
-                if case .success(let html) = result {
-                    let posts = self.parseSyndicatedPosts(html)
+            // xcancel currently exposes the live timeline directly. This is
+            // intentionally attempted before the official embed, whose
+            // timeline can lag by months even while the profile is active.
+            self.fetchPage(self.directTimelineURL) { direct in
+                if case .success(let html) = direct {
+                    let posts = self.parseXCancelPosts(html)
                     if self.isFresh(posts) { completion(.success(posts)); return }
                 }
-                self.fetchPage(self.profileURL) { fallback in
-                    guard case .success(let html) = fallback else {
-                        completion(.failure(MonitorError.invalidResponse)); return
+                self.fetchPage(self.syndicationURL) { result in
+                    if case .success(let html) = result {
+                        let posts = self.parseSyndicatedPosts(html)
+                        if self.isFresh(posts) { completion(.success(posts)); return }
                     }
-                    let posts = self.parsePosts(html)
-                    guard self.isFresh(posts) else {
-                        completion(.failure(MonitorError.staleTimeline)); return
+                    self.fetchPage(self.profileURL) { fallback in
+                        guard case .success(let html) = fallback else {
+                            completion(.failure(MonitorError.invalidResponse)); return
+                        }
+                        let posts = self.parsePosts(html)
+                        guard self.isFresh(posts) else {
+                            completion(.failure(MonitorError.staleTimeline)); return
+                        }
+                        completion(.success(posts))
                     }
-                    completion(.success(posts))
                 }
+            }
+        }
+    }
+
+    private func fetchReplies(completion: @escaping ([TiboPost]) -> Void) {
+        fetchPage(repliesMirrorURL) { result in
+            if case .success(let markdown) = result {
+                let posts = self.parseReplyPosts(markdown)
+                if !posts.isEmpty { completion(posts); return }
+            }
+            self.fetchPage(self.directRepliesURL) { direct in
+                guard case .success(let html) = direct else { completion([]); return }
+                completion(self.parseXCancelPosts(html))
+            }
+        }
+    }
+
+    private func fetchMainHighlights(completion: @escaping ([TiboPost]) -> Void) {
+        fetchPage(mainMirrorURL) { result in
+            if case .success(let markdown) = result {
+                let posts = self.parseMainResetHighlights(markdown)
+                if !posts.isEmpty { completion(posts); return }
+            }
+            // The direct HTML timeline is also a useful fallback for reset
+            // announcements; normal posts are already merged from primary.
+            self.fetchPage(self.directTimelineURL) { direct in
+                guard case .success(let html) = direct else { completion([]); return }
+                let posts = self.parseXCancelPosts(html).filter { post in
+                    let text = post.text.lowercased()
+                    return text.contains("reset") &&
+                        (text.contains("limit") || text.contains("usage") || text.contains("rate"))
+                }
+                completion(posts)
             }
         }
     }
@@ -239,6 +280,42 @@ final class TiboMonitor {
             waitingForBody = false
         }
         return posts.sorted { $0.publishedAt > $1.publishedAt }.prefix(12).map { $0 }
+    }
+
+    /// Parse the current xcancel HTML layout. Unlike the old Jina markdown
+    /// representation, direct xcancel pages expose each post as a timeline
+    /// item with a stable status link and tweet-content node.
+    private func parseXCancelPosts(_ html: String) -> [TiboPost] {
+        guard let regex = try? NSRegularExpression(
+            pattern: #"<a class=\"tweet-link\" href=\"/thsottiaux/status/(\d+)#m\"></a>(.*?<div class=\"tweet-content media-body\"[^>]*>(.*?)</div>)"#,
+            options: [.dotMatchesLineSeparators]
+        ) else { return [] }
+        let nsHTML = html as NSString
+        let matches = regex.matches(in: html, range: NSRange(location: 0, length: nsHTML.length))
+        let avatarURL = firstTiboAvatarURL(in: html)
+        var seen = Set<String>()
+        var posts: [TiboPost] = []
+        for match in matches {
+            let id = nsHTML.substring(with: match.range(at: 1))
+            guard seen.insert(id).inserted, let date = dateFromSnowflake(id) else { continue }
+            let context = nsHTML.substring(with: match.range(at: 2))
+            let body = nsHTML.substring(with: match.range(at: 3))
+            let text = stripHTML(body).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
+            posts.append(TiboPost(
+                id: id,
+                text: text,
+                publishedAt: date,
+                url: "https://x.com/thsottiaux/status/\(id)",
+                avatarURL: avatarURL,
+                isReply: context.contains("class=\"replying-to\"")
+            ))
+        }
+        let sorted = posts.sorted { $0.publishedAt > $1.publishedAt }
+        let substantive = sorted.filter { !$0.isReply }
+        let replies = sorted.filter(\.isReply).prefix(6)
+        let selected = Array(substantive.prefix(12)) + Array(replies)
+        return Array(selected.prefix(16)).sorted { $0.publishedAt > $1.publishedAt }
     }
 
     private func parseMainResetHighlights(_ markdown: String) -> [TiboPost] {
@@ -330,8 +407,8 @@ final class TiboMonitor {
             for meta in metaRegex.matches(in: body, range: NSRange(location: 0, length: nsBody.length)) {
                 metadata[nsBody.substring(with: meta.range(at: 2))] = decodeHTMLEntities(nsBody.substring(with: meta.range(at: 1)))
             }
-            guard let text = metadata["articleBody"]?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty,
-                  let dateText = metadata["datePublished"], let date = iso.date(from: dateText) else { continue }
+            guard let text = (metadata["articleBody"] ?? metadata["text"])?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty,
+                  let dateText = metadata["datePublished"], let date = parseISO8601Date(dateText, formatter: iso) else { continue }
             let canonicalURL = "https://x.com/thsottiaux/status/\(id)"
             posts.append(TiboPost(id: id, text: text, publishedAt: date,
                                   url: canonicalURL, avatarURL: firstTiboAvatarURL(in: html), isReply: false))
@@ -353,6 +430,7 @@ final class TiboMonitor {
             return
         }
         if !forceAnalysis, fingerprint == snapshot.fingerprint, snapshot.analyzedAt != nil,
+           snapshot.status == "current",
            latestReply?.url == snapshot.latestReplyURL {
             snapshot.checkedAt = Date()
             snapshot.status = "current"
@@ -362,46 +440,72 @@ final class TiboMonitor {
         }
         analyze(posts: posts, configuration: configuration) { result in
             self.queue.async {
+                let digest: AIActivityDigest
+                let status: String
                 switch result {
-                case .success(let digest):
-                    let proposedTimeZone = digest.timeZone.flatMap(TimeZone.init(identifier:))
-                    let hasLocationEvidence = digest.locationMode == "inferred"
-                        && proposedTimeZone != nil
-                        && digest.location?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-                    let resolvedTimeZone = hasLocationEvidence ? proposedTimeZone! : TimeZone(identifier: "America/Los_Angeles")!
-                    self.snapshot = TiboActivitySnapshot(
-                        fingerprint: fingerprint,
-                        headline: normalizedTiboHeadline(digest.headline),
-                        summary: limitedText(digest.summary, maximum: 66),
-                        latestPostAt: posts.first?.publishedAt,
-                        analyzedAt: Date(), checkedAt: Date(),
-                        sourceURL: posts.first?.url ?? self.profileURL.absoluteString,
-                        status: "current",
-                        activityState: deterministicActivityState(posts: posts, timeZone: resolvedTimeZone),
-                        inferredLocation: hasLocationEvidence ? limitedText(digest.location!, maximum: 12) : "旧金山湾区",
-                        timeZoneIdentifier: hasLocationEvidence ? proposedTimeZone!.identifier : "America/Los_Angeles",
-                        locationIsInferred: hasLocationEvidence,
-                        avatarURL: posts.compactMap(\.avatarURL).first ?? self.snapshot.avatarURL
-                            ?? "https://pbs.twimg.com/profile_images/2075819673263001600/pj1vyX6I.jpg",
-                        latestReplyText: latestReply.map { replyDisplayText($0.text) },
-                        latestReplyAt: latestReply?.publishedAt,
-                        latestReplyURL: latestReply?.url
-                    )
+                case .success(let value):
+                    digest = value
+                    status = "current"
                 case .failure:
-                    self.snapshot.checkedAt = Date()
-                    self.snapshot.status = self.snapshot.analyzedAt == nil ? "analysis-error" : "stale"
+                    // Keep fresh source data visible if a provider is
+                    // temporarily unavailable or truncates its response.
+                    digest = self.fallbackDigest(posts: posts)
+                    status = "current-fallback"
                 }
+                self.apply(digest: digest, status: status, posts: posts,
+                           fingerprint: fingerprint, latestReply: latestReply)
                 self.save()
                 self.finish(completion)
             }
         }
     }
 
+    private func apply(digest: AIActivityDigest, status: String, posts: [TiboPost],
+                       fingerprint: String, latestReply: TiboPost?) {
+        let proposedTimeZone = digest.timeZone.flatMap(TimeZone.init(identifier:))
+        let hasLocationEvidence = digest.locationMode == "inferred"
+            && proposedTimeZone != nil
+            && digest.location?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        let resolvedTimeZone = hasLocationEvidence
+            ? proposedTimeZone!
+            : TimeZone(identifier: "America/Los_Angeles")!
+        snapshot = TiboActivitySnapshot(
+            fingerprint: fingerprint,
+            headline: normalizedTiboHeadline(digest.headline),
+            summary: limitedText(digest.summary, maximum: 66),
+            latestPostAt: posts.first?.publishedAt,
+            analyzedAt: Date(), checkedAt: Date(),
+            sourceURL: posts.first?.url ?? profileURL.absoluteString,
+            status: status,
+            activityState: deterministicActivityState(posts: posts, timeZone: resolvedTimeZone),
+            inferredLocation: hasLocationEvidence ? limitedText(digest.location!, maximum: 12) : "旧金山湾区",
+            timeZoneIdentifier: hasLocationEvidence ? proposedTimeZone!.identifier : "America/Los_Angeles",
+            locationIsInferred: hasLocationEvidence,
+            avatarURL: posts.compactMap(\.avatarURL).first ?? snapshot.avatarURL
+                ?? "https://pbs.twimg.com/profile_images/2075819673263001600/pj1vyX6I.jpg",
+            latestReplyText: latestReply.map { replyDisplayText($0.text) },
+            latestReplyAt: latestReply?.publishedAt,
+            latestReplyURL: latestReply?.url
+        )
+    }
+
+    private func fallbackDigest(posts: [TiboPost]) -> AIActivityDigest {
+        let post = posts.first(where: { !$0.isReply }) ?? posts[0]
+        let firstLine = post.text.components(separatedBy: .newlines).first ?? post.text
+        return AIActivityDigest(
+            headline: limitedText("新帖：\(firstLine)", maximum: 14),
+            summary: limitedText(post.text, maximum: 66),
+            location: "旧金山湾区",
+            timeZone: "America/Los_Angeles",
+            locationMode: "fallback"
+        )
+    }
+
     private func analyze(posts: [TiboPost], configuration: AIServiceConfiguration,
                          completion: @escaping (Result<AIActivityDigest, Error>) -> Void) {
         let formatter = ISO8601DateFormatter()
-        let source = posts.enumerated().map { index, post in
-            "[\(index + 1)] \(formatter.string(from: post.publishedAt))\n\(post.text)\n\(post.url)"
+        let source = posts.prefix(10).enumerated().map { index, post in
+            "[\(index + 1)] \(formatter.string(from: post.publishedAt))\n\(limitedText(post.text, maximum: 360))\n\(post.url)"
         }.joined(separator: "\n\n")
         let system = """
         你是“Codex 重置之神 Tibo”的公开动态观察员。只根据给出的帖子工作，并遵循以下优先级：
@@ -419,8 +523,9 @@ final class TiboMonitor {
                 ["role": "user", "content": "当前 UTC 时间：\(formatter.string(from: Date()))\n以下按发布时间从新到旧排列：\n\n\(source)"]
             ],
             "temperature": 0.2,
-            // Reasoning-capable compatible models count hidden reasoning toward this limit.
-            // Keep enough headroom so the short JSON answer is not truncated to empty content.
+            // Reasoning-capable compatible models count hidden reasoning toward
+            // this limit. Keep the request bounded; a truncated provider reply
+            // is handled by the deterministic fresh-source fallback below.
             "max_tokens": 1024,
             "stream": false
         ]
@@ -440,12 +545,25 @@ final class TiboMonitor {
         }
         session.dataTask(with: request) { data, response, error in
             if let error { completion(.failure(error)); return }
-            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode), let data,
-                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode), let data else {
+                completion(.failure(MonitorError.analysisFailed)); return
+            }
+            guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let choices = root["choices"] as? [[String: Any]],
-                  let message = choices.first?["message"] as? [String: Any],
-                  let content = message["content"] as? String,
-                  let contentData = extractedJSONObject(from: content)?.data(using: .utf8),
+                  let message = choices.first?["message"] as? [String: Any] else {
+                completion(.failure(MonitorError.analysisFailed)); return
+            }
+            // Reasoning-capable compatible models may put the final answer in
+            // `reasoning_content` while leaving `content` empty. Accept both
+            // shapes so a provider-specific response format cannot freeze the
+            // dynamic card on its previous summary.
+            let content = (message["content"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let reasoning = (message["reasoning_content"] as? String)
+                ?? (message["reasoning"] as? String)
+                ?? ""
+            let output = content.isEmpty ? reasoning : content
+            let extracted = extractedJSONObject(from: output)
+            guard let contentData = extracted?.data(using: .utf8),
                   let digest = try? JSONDecoder().decode(AIActivityDigest.self, from: contentData),
                   !digest.headline.isEmpty, !digest.summary.isEmpty else {
                 completion(.failure(MonitorError.analysisFailed)); return
@@ -513,6 +631,13 @@ private func dateFromSnowflake(_ id: String) -> Date? {
     return Date(timeIntervalSince1970: TimeInterval(milliseconds) / 1_000)
 }
 
+private func parseISO8601Date(_ value: String, formatter: ISO8601DateFormatter) -> Date? {
+    if let date = formatter.date(from: value) { return date }
+    let fallback = ISO8601DateFormatter()
+    fallback.formatOptions = [.withInternetDateTime]
+    return fallback.date(from: value)
+}
+
 private func limitedText(_ text: String, maximum: Int) -> String {
     let normalized = text
         .replacingOccurrences(of: "\n", with: " ")
@@ -553,6 +678,10 @@ private func deterministicActivityState(posts: [TiboPost], timeZone: TimeZone) -
 private func extractedJSONObject(from text: String) -> String? {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
     if trimmed.hasPrefix("{") && trimmed.hasSuffix("}") { return trimmed }
-    guard let start = trimmed.firstIndex(of: "{"), let end = trimmed.lastIndex(of: "}"), start < end else { return nil }
+    // Reasoning models can mention an intermediate JSON example before their
+    // final answer. Select the object nearest the end of the response so that
+    // an earlier example cannot make an otherwise valid response fail decode.
+    guard let end = trimmed.lastIndex(of: "}"),
+          let start = trimmed[..<end].lastIndex(of: "{"), start < end else { return nil }
     return String(trimmed[start...end])
 }
