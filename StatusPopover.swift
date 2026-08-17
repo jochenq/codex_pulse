@@ -91,7 +91,7 @@ final class StatusPopoverController: NSViewController {
         planLabel.stringValue = "LOADING"
         windowTitle.stringValue = "正在刷新"
         quotaDetail.stringValue = "loading"
-        progress.usedPercent = nil
+        progress.elapsedPercent = nil
         resetLabel.stringValue = ""
         shortQuotaLabel.isHidden = true
         callsValue.stringValue = "loading"
@@ -109,7 +109,8 @@ final class StatusPopoverController: NSViewController {
         ring.remaining = mainUsed.map { max(0, 100 - $0) }
         windowTitle.stringValue = windowName(mainMinutes)
         quotaDetail.stringValue = mainUsed.map { "已用 \($0)%  ·  剩余 \(max(0, 100 - $0))%" } ?? "额度暂时无法读取"
-        progress.usedPercent = mainUsed
+        progress.elapsedPercent = resetCycleElapsedPercent(windowMinutes: mainMinutes, resetAt: mainReset)
+        progress.toolTip = progress.elapsedPercent.map { "重置周期已过去 \($0)%" } ?? "重置周期暂不可用"
         resetLabel.stringValue = mainReset.map { "重置于 \(fullDate($0))  ·  \(relativeTime($0))" } ?? "重置时间暂不可用"
         let plan = (snapshot?.plan ?? "--").uppercased()
         let credits = snapshot?.credits.map { String(format: "%.2f", $0) } ?? "--"
@@ -476,7 +477,7 @@ private final class RefreshIconButton: ClickableButton {
 }
 
 private final class QuotaProgressView: NSView {
-    var usedPercent: Int? { didSet { needsDisplay = true } }
+    var elapsedPercent: Int? { didSet { needsDisplay = true } }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
@@ -484,13 +485,20 @@ private final class QuotaProgressView: NSView {
         let track = NSBezierPath(roundedRect: rect, xRadius: rect.height / 2, yRadius: rect.height / 2)
         NSColor.labelColor.withAlphaComponent(0.18).setFill()
         track.fill()
-        guard let usedPercent else { return }
-        let width = rect.width * CGFloat(max(0, min(100, usedPercent))) / 100
+        guard let elapsedPercent else { return }
+        let width = rect.width * CGFloat(max(0, min(100, elapsedPercent))) / 100
         guard width > 0 else { return }
         let fillRect = NSRect(x: rect.minX, y: rect.minY, width: max(rect.height, width), height: rect.height)
         NSColor.systemBlue.setFill()
         NSBezierPath(roundedRect: fillRect, xRadius: rect.height / 2, yRadius: rect.height / 2).fill()
     }
+}
+
+private func resetCycleElapsedPercent(windowMinutes: Int?, resetAt: Date?, now: Date = Date()) -> Int? {
+    guard let windowMinutes, windowMinutes > 0, let resetAt else { return nil }
+    let duration = Double(windowMinutes) * 60
+    let elapsed = duration - resetAt.timeIntervalSince(now)
+    return max(0, min(100, Int((elapsed / duration * 100).rounded())))
 }
 
 private final class ResetCreditIconView: NSView {
