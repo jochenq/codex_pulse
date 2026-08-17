@@ -28,7 +28,7 @@ final class StatusPopoverController: NSViewController {
     private let tiboHeadline = label("正在获取公开动态", size: 13, weight: .semibold)
     private let tiboSummary = label("首次分析完成后会显示在这里。", size: 11, color: .secondaryLabelColor)
     private let tiboReply = label("", size: 10, weight: .medium, color: .secondaryLabelColor)
-    private let tiboLocalTime = label("旧金山湾区 / PT", size: 10, weight: .medium, color: .secondaryLabelColor)
+    private let tiboLocalTime = label("地点与时区未知", size: 10, weight: .medium, color: .secondaryLabelColor)
     private let tiboMeta = label("尚未检查", size: 10, color: .tertiaryLabelColor)
     private let tiboAvatar = NSImageView(image: NSImage(systemSymbolName: "person.crop.circle.fill", accessibilityDescription: "Tibo 头像") ?? NSImage())
     private let tiboSectionTitle = label("Tibo", size: 12, weight: .semibold)
@@ -79,7 +79,6 @@ final class StatusPopoverController: NSViewController {
         let clockTimer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
             guard let self, let snapshot = self.latestTiboSnapshot else { return }
             self.tiboLocalTime.stringValue = tiboPlaceAndTime(snapshot)
-            self.tiboStateLabel.stringValue = displayTiboState(snapshot)
         }
         RunLoop.main.add(clockTimer, forMode: .common)
         tiboClockTimer = clockTimer
@@ -153,7 +152,7 @@ final class StatusPopoverController: NSViewController {
         case "current":
             tiboMeta.stringValue = checked + latest
         case "current-fallback":
-            tiboMeta.stringValue = "自动摘要 · " + checked + latest
+            tiboMeta.stringValue = "原文回退 · " + checked + latest
         case "loading":
             tiboMeta.stringValue = "正在更新 Tibo 动态…"
         case "missing-configuration":
@@ -617,28 +616,22 @@ private func shortActivityDate(_ date: Date) -> String {
 }
 
 private func tiboPlaceAndTime(_ snapshot: TiboActivitySnapshot) -> String {
-    let identifier = snapshot.timeZoneIdentifier ?? "America/Los_Angeles"
-    let timeZone = TimeZone(identifier: identifier) ?? TimeZone(identifier: "America/Los_Angeles")!
+    guard let identifier = snapshot.timeZoneIdentifier,
+          let timeZone = TimeZone(identifier: identifier) else {
+        return "地点与时区未知 · 等待动态证据"
+    }
     let formatter = DateFormatter()
     formatter.locale = Locale(identifier: "zh_CN")
     formatter.timeZone = timeZone
     formatter.dateFormat = "HH:mm:ss EEE"
-    let location = snapshot.inferredLocation?.isEmpty == false ? snapshot.inferredLocation! : "旧金山湾区"
+    let location = snapshot.inferredLocation?.isEmpty == false ? snapshot.inferredLocation! : "地点未知"
     let abbreviation = timeZone.abbreviation(for: Date()) ?? identifier
-    let source = snapshot.locationIsInferred == true ? "动态推测" : "默认时区"
-    return "\(location) / \(abbreviation) · \(formatter.string(from: Date())) · \(source)"
+    return "\(location) / \(abbreviation) · \(formatter.string(from: Date())) · AI 据动态判断"
 }
 
 private func displayTiboState(_ snapshot: TiboActivitySnapshot) -> String {
-    if snapshot.activityState == "休假" { return "休假" }
-    let timeZone = TimeZone(identifier: snapshot.timeZoneIdentifier ?? "America/Los_Angeles")
-        ?? TimeZone(identifier: "America/Los_Angeles")!
-    var calendar = Calendar(identifier: .gregorian)
-    calendar.timeZone = timeZone
-    let hour = calendar.component(.hour, from: Date())
-    if hour < 7 { return "睡觉" }
-    if hour < 19 { return "工作" }
-    return "休息"
+    let value = snapshot.activityState?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return value.isEmpty ? "状态未知" : String(value.prefix(5))
 }
 
 private func displayTiboHeadline(_ headline: String) -> String {
