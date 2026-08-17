@@ -127,7 +127,7 @@ final class TiboMonitor {
         group.notify(queue: queue) {
             let primary: [TiboPost]
             if case .success(let posts)? = primaryResult { primary = posts } else { primary = [] }
-            let merged = self.mergedPosts(primary + replies, limit: 16)
+            let merged = self.mergedPosts(primary + replies)
             if self.isFresh(merged) { completion(.success(merged)) }
             else { completion(.failure(MonitorError.staleTimeline)) }
         }
@@ -154,7 +154,7 @@ final class TiboMonitor {
         fetch(syndicationURL, parser: parseSyndicatedPosts)
         fetch(profileURL, parser: parsePosts)
         group.notify(queue: queue) {
-            let posts = self.mergedPosts(collected, limit: 16)
+            let posts = self.mergedPosts(collected)
             if self.isFresh(posts) { completion(.success(posts)) }
             else { completion(.failure(MonitorError.staleTimeline)) }
         }
@@ -210,8 +210,8 @@ final class TiboMonitor {
         }
         let sorted = posts.sorted { $0.publishedAt > $1.publishedAt }
         let substantive = sorted.filter { !$0.text.hasPrefix("@") }
-        let replies = sorted.filter { $0.text.hasPrefix("@") }.prefix(4)
-        return Array((substantive + replies).prefix(12)).sorted { $0.publishedAt > $1.publishedAt }
+        let replies = sorted.filter { $0.text.hasPrefix("@") }
+        return (substantive + replies).sorted { $0.publishedAt > $1.publishedAt }
     }
 
     private func parseReplyPosts(_ markdown: String) -> [TiboPost] {
@@ -243,7 +243,7 @@ final class TiboMonitor {
             ))
             waitingForBody = false
         }
-        return posts.sorted { $0.publishedAt > $1.publishedAt }.prefix(12).map { $0 }
+        return posts.sorted { $0.publishedAt > $1.publishedAt }
     }
 
     /// Parse the current xcancel HTML layout. Unlike the old Jina markdown
@@ -277,9 +277,8 @@ final class TiboMonitor {
         }
         let sorted = posts.sorted { $0.publishedAt > $1.publishedAt }
         let substantive = sorted.filter { !$0.isReply }
-        let replies = sorted.filter(\.isReply).prefix(6)
-        let selected = Array(substantive.prefix(12)) + Array(replies)
-        return Array(selected.prefix(16)).sorted { $0.publishedAt > $1.publishedAt }
+        let replies = sorted.filter(\.isReply)
+        return (substantive + replies).sorted { $0.publishedAt > $1.publishedAt }
     }
 
     private func parseSyndicatedPosts(_ html: String) -> [TiboPost] {
@@ -315,7 +314,7 @@ final class TiboMonitor {
             posts.append(TiboPost(id: id, text: text, publishedAt: date,
                                   url: "https://x.com/thsottiaux/status/\(id)", avatarURL: avatarURL, isReply: false))
         }
-        return posts.sorted { $0.publishedAt > $1.publishedAt }.prefix(12).map { $0 }
+        return posts.sorted { $0.publishedAt > $1.publishedAt }
     }
 
     private func isFresh(_ posts: [TiboPost]) -> Bool {
@@ -324,7 +323,7 @@ final class TiboMonitor {
         return age >= -5 * 60 && age < 14 * 24 * 60 * 60
     }
 
-    private func mergedPosts(_ posts: [TiboPost], limit: Int) -> [TiboPost] {
+    private func mergedPosts(_ posts: [TiboPost]) -> [TiboPost] {
         var byID: [String: TiboPost] = [:]
         for candidate in posts {
             guard let current = byID[candidate.id] else {
@@ -341,7 +340,7 @@ final class TiboMonitor {
         return byID.values.sorted {
             if $0.publishedAt != $1.publishedAt { return $0.publishedAt > $1.publishedAt }
             return $0.id > $1.id
-        }.prefix(limit).map { $0 }
+        }
     }
 
     private func parsePosts(_ html: String) -> [TiboPost] {
@@ -373,7 +372,7 @@ final class TiboMonitor {
             posts.append(TiboPost(id: id, text: text, publishedAt: date,
                                   url: canonicalURL, avatarURL: firstTiboAvatarURL(in: html), isReply: false))
         }
-        return posts.sorted { $0.publishedAt > $1.publishedAt }.prefix(8).map { $0 }
+        return posts.sorted { $0.publishedAt > $1.publishedAt }
     }
 
     private func handle(posts: [TiboPost], forceAnalysis: Bool,
