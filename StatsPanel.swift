@@ -915,8 +915,11 @@ private func matchesModel(_ model: String, _ base: String) -> Bool {
 
 private func apiPrice(for rawModel: String) -> APIPrice? {
     let model = rawModel.lowercased()
+    if matchesModel(model, "gpt-6-astra") {
+        return APIPrice(name: "GPT-6 Astra", input: 10, cached: 1, output: 50)
+    }
     if matchesModel(model, "gpt-5.6-sol") || matchesModel(model, "gpt-5.6") {
-        return APIPrice(name: "GPT-5.6 Sol", input: 5, cached: 0.5, output: 30)
+        return APIPrice(name: "GPT-5.6 Sol", input: 4, cached: 0.4, output: 20)
     }
     if matchesModel(model, "gpt-5.6-terra") {
         return APIPrice(name: "GPT-5.6 Terra", input: 2, cached: 0.2, output: 12)
