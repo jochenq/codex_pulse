@@ -30,7 +30,9 @@ open "../Codex Pulse Monitor.app"
 
 点击“Tibo 动态”旁的设置按钮可配置任意 OpenAI Chat Completions 兼容服务，包括 Base URL、API Key 和模型。应用可通过兼容的 `GET /models` 接口自动拉取模型列表，也允许手动输入模型 ID。Base URL 与模型保存在本地偏好，API Key 以 AES 加密文件保存在应用支持目录，不访问 macOS 钥匙串；应用也不读取 `DEEPSEEK_API_KEY` 或其他 AI 环境变量。
 
-成功分析的证据未变化时只更新检查时间。失败不会缓存为成功：保留上次中文分析，下一次检查重试，连续手动触发最少间隔 60 秒。首次失败显示中文提示，不展示英文原文或内部推理。保存 AI 配置可重新分析。模型返回的来源 ID 必须属于输入帖子，“查看”打开核心结论的原帖。摘要缓存为 `~/Library/Application Support/Codex Pulse/tibo-reset-activity-v2.json`，不沿用旧版英文回退缓存。
+成功分析的证据未变化时只更新检查时间。跨轮次帖子缓存保留曾取得的记录，镜像短暂缺帖不会造成重复分析。新证据合并后最多每 30 分钟调用一次 AI，每个 UTC 日最多 24 次，计数与重试时间跨重启保留。失败按 30 分钟、1 小时、2 小时等退避，最长 6 小时；HTTP 400/401/402/403/404 暂停自动请求，处理余额或配置后重新保存 AI 配置恢复，日上限仍有效。首次失败显示中文提示，已有中文结果则保留。模型返回的来源 ID 必须属于输入帖子，“查看”打开核心结论原帖。
+
+证据 JSON 使用紧凑格式，旧帖在前、新帖追加，当前时间放末尾以保持前缀稳定；实际服务端缓存命中由供应商决定。DeepSeek 关闭隐藏推理，输出上限 512 Token。单次请求 JSON 超过 96 KB 则拒绝调用，不静默截断证据。摘要与查询缓存分别为 `tibo-reset-activity-v2.json`、`tibo-query-cache.json`。AI 审计日志 `~/Library/Application Support/Codex Pulse/tibo-ai-calls.jsonl` 记录开始/结束、模型、请求 ID、正文大小、帖子数、HTTP 状态、耗时、成功与否及供应商返回的完整 usage（含可用的缓存/推理 Token）。不记录密钥、请求正文或回复正文；无 usage 的失败不会伪造为零 Token。
 
 Token 数字会自动使用 `K`、`M`、`B` 紧凑显示。点击菜单中的“统计面板…”（`⌘D`）可打开原生统计窗口，支持：
 

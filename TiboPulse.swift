@@ -31,13 +31,24 @@ struct TiboActivitySnapshot: Codable {
     }
 }
 
-private struct TiboPost {
+private struct TiboPost: Codable {
     let id: String
     let text: String
     let publishedAt: Date
     let url: String
     let avatarURL: String?
     let isReply: Bool
+}
+
+private struct TiboQueryCache: Codable {
+    var posts: [TiboPost] = []
+    var configuration = ""
+    var successfulFingerprint = ""
+    var nextAttempt: Date = .distantPast
+    var failures = 0
+    var blocked = false
+    var day = ""
+    var attempts = 0
 }
 
 private struct AIActivityDigest: Decodable {
@@ -63,6 +74,9 @@ final class TiboMonitor {
     private let queue = DispatchQueue(label: "com.codexpulse.tibo-monitor", qos: .utility)
     private let session: URLSession
     private let cacheURL: URL
+    private let queryCacheURL: URL
+    private let callLogURL: URL
+    private var queryCache = TiboQueryCache()
     private var running = false
     private var lastAnalysisAttempt: Date?
     private var pendingForcedCompletion: ((TiboActivitySnapshot) -> Void)?
@@ -78,11 +92,25 @@ final class TiboMonitor {
             .appendingPathComponent("Codex Pulse", isDirectory: true)
         try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
         cacheURL = support.appendingPathComponent("tibo-reset-activity-v2.json")
+        queryCacheURL = support.appendingPathComponent("tibo-query-cache.json")
+        callLogURL = support.appendingPathComponent("tibo-ai-calls.jsonl")
+        if let data = try? Data(contentsOf: queryCacheURL),
+           let cache = try? JSONDecoder().decode(TiboQueryCache.self, from: data) {
+            queryCache = cache
+        }
         if let data = try? Data(contentsOf: cacheURL),
            let saved = try? JSONDecoder().decode(TiboActivitySnapshot.self, from: data) {
             snapshot = saved
         } else {
             snapshot = .empty()
+        }
+        // Do not spend a probe on an account already known to be out of balance.
+        if queryCache.configuration.isEmpty, snapshot.analysisError?.contains("余额不足") == true {
+            let config = AIConfigurationStore.shared.load()
+            queryCache.configuration = SHA256.hash(data: Data((config.baseURL + "|" + config.model + "|" + config.apiKey).utf8))
+                .map { String(format: "%02x", $0) }.joined()
+            queryCache.blocked = true
+            saveQueryCache()
         }
     }
 
@@ -380,12 +408,26 @@ final class TiboMonitor {
 
     private func handle(posts: [TiboPost], forceAnalysis: Bool,
                         completion: @escaping (TiboActivitySnapshot) -> Void) {
+        // Preserve known records when a mirror temporarily omits them.
+        // A richer version can replace a short version; missing records cannot.
+        let posts = mergedPosts(queryCache.posts + posts)
+        queryCache.posts = posts
         let canonical = "tibo-reset-zh-v8\n" + posts.map {
             "\($0.id)|\($0.isReply)|\($0.publishedAt.timeIntervalSince1970)|\($0.text)"
         }.joined(separator: "\n")
         let fingerprint = SHA256.hash(data: Data(canonical.utf8)).map { String(format: "%02x", $0) }.joined()
         let latestReply = posts.first(where: \.isReply)
         let configuration = AIConfigurationStore.shared.load()
+        let configID = SHA256.hash(data: Data((configuration.baseURL + "|" + configuration.model + "|" + configuration.apiKey).utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        if queryCache.configuration != configID {
+            queryCache.configuration = configID
+            queryCache.blocked = false
+            queryCache.failures = 0
+            queryCache.nextAttempt = .distantPast
+            queryCache.successfulFingerprint = ""
+        }
+        saveQueryCache()
         guard configuration.isConfigured else {
             snapshot.checkedAt = Date()
             snapshot.status = "missing-configuration"
@@ -393,9 +435,7 @@ final class TiboMonitor {
             finish(completion)
             return
         }
-        if !forceAnalysis, fingerprint == snapshot.fingerprint, snapshot.analyzedAt != nil,
-           snapshot.status != "analysis-error",
-           latestReply?.url == snapshot.latestReplyURL {
+        if fingerprint == queryCache.successfulFingerprint, snapshot.analyzedAt != nil {
             snapshot.checkedAt = Date()
             if ["stale", "fetch-error", "source-stale"].contains(snapshot.status) {
                 snapshot.status = "current"
@@ -404,12 +444,35 @@ final class TiboMonitor {
             finish(completion)
             return
         }
-        if let attempted = lastAnalysisAttempt, Date().timeIntervalSince(attempted) < 60 {
+        let today = ISO8601DateFormatter().string(from: Date()).prefix(10)
+        if queryCache.day != today {
+            queryCache.day = String(today)
+            queryCache.attempts = 0
+        }
+        // Manual refresh obeys the same spending controls. Saving configuration
+        // explicitly allows retrying a blocked account after a top-up.
+        if forceAnalysis && queryCache.blocked {
+            queryCache.blocked = false
+            queryCache.nextAttempt = .distantPast
+        }
+        if queryCache.blocked || Date() < queryCache.nextAttempt || queryCache.attempts >= 24 {
             snapshot.checkedAt = Date()
+            if queryCache.blocked {
+                snapshot.analysisError = "AI 自动请求已暂停，请检查余额或配置，处理后重新保存 AI 配置恢复。"
+            } else if queryCache.attempts >= 24 {
+                snapshot.analysisError = "今日 AI 请求已达 24 次上限，次日恢复。"
+            } else {
+                snapshot.analysisError = "已缓存最新帖子，等待下次 AI 分析时段。"
+            }
+            saveQueryCache()
+            save()
             finish(completion)
             return
         }
         lastAnalysisAttempt = Date()
+        queryCache.attempts += 1
+        queryCache.nextAttempt = Date().addingTimeInterval(30 * 60)
+        saveQueryCache()
         analyze(posts: posts, configuration: configuration) { result in
             self.queue.async {
                 let digest: AIActivityDigest
@@ -418,7 +481,18 @@ final class TiboMonitor {
                 case .success(let value):
                     digest = value
                     status = "current"
+                    self.queryCache.successfulFingerprint = fingerprint
+                    self.queryCache.failures = 0
+                    self.saveQueryCache()
                 case .failure(let error):
+                    self.queryCache.failures += 1
+                    let delay = min(6 * 3600.0, 1800 * pow(2, Double(min(self.queryCache.failures - 1, 4))))
+                    self.queryCache.nextAttempt = Date().addingTimeInterval(delay)
+                    if case .apiRejected(let code) = error as? MonitorError,
+                       [400, 401, 402, 403, 404].contains(code) {
+                        self.queryCache.blocked = true
+                    }
+                    self.saveQueryCache()
                     self.snapshot.checkedAt = Date()
                     self.snapshot.status = "analysis-error"
                     self.snapshot.analysisError = (error as? MonitorError)?.displayMessage ?? "AI 网络请求失败，请检查网络或服务配置"
@@ -467,7 +541,7 @@ final class TiboMonitor {
     private func analyze(posts: [TiboPost], configuration: AIServiceConfiguration,
                          completion: @escaping (Result<AIActivityDigest, Error>) -> Void) {
         let formatter = ISO8601DateFormatter()
-        let evidence: [[String: Any]] = posts.map { post in
+        let evidence: [[String: Any]] = posts.sorted { $0.publishedAt < $1.publishedAt }.map { post in
             [
                 "post_id": post.id,
                 "kind": post.isReply ? "reply" : "post",
@@ -476,7 +550,7 @@ final class TiboMonitor {
                 "url": post.url
             ]
         }
-        guard let evidenceData = try? JSONSerialization.data(withJSONObject: evidence, options: [.prettyPrinted, .sortedKeys]),
+        guard let evidenceData = try? JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys]),
               let source = String(data: evidenceData, encoding: .utf8) else {
             completion(.failure(MonitorError.invalidRequest)); return
         }
@@ -495,7 +569,7 @@ final class TiboMonitor {
             "model": configuration.model,
             "messages": [
                 ["role": "system", "content": system],
-                ["role": "user", "content": "当前 UTC 时间：\(formatter.string(from: Date()))\n以下 JSON 数组按发布时间从新到旧排列：\n\n\(source)"]
+                ["role": "user", "content": "以下为按发布时间从旧到新排列的历史与新增证据：\n\(source)\n当前 UTC 时间：\(formatter.string(from: Date()))"]
             ],
             "temperature": 0.2,
             "response_format": ["type": "json_object"],
@@ -508,9 +582,13 @@ final class TiboMonitor {
         // A short extraction task needs a final answer, not a reasoning transcript.
         if URL(string: configuration.baseURL)?.host == "api.deepseek.com" {
             body["thinking"] = ["type": "disabled"]
+            body["max_tokens"] = 512
         }
         guard let json = try? JSONSerialization.data(withJSONObject: body) else {
             completion(.failure(MonitorError.invalidRequest)); return
+        }
+        guard json.count <= 96_000 else {
+            completion(.failure(MonitorError.inputBudgetExceeded)); return
         }
         guard let endpoint = OpenAICompatibleEndpoint.url(baseURL: configuration.baseURL,
                                                           operation: "chat/completions") else {
@@ -523,7 +601,28 @@ final class TiboMonitor {
         if !configuration.apiKey.isEmpty {
             request.setValue("Bearer \(configuration.apiKey)", forHTTPHeaderField: "Authorization")
         }
+        let started = Date()
+        let requestID = UUID().uuidString
+        self.recordCall(["event": "started", "request_id": requestID, "model": configuration.model,
+                         "request_bytes": json.count, "post_count": posts.count])
         session.dataTask(with: request) { data, response, error in
+            var outcome = "failed"
+            defer {
+                var record: [String: Any] = [
+                    "event": "finished", "request_id": requestID, "model": configuration.model,
+                    "http_status": (response as? HTTPURLResponse)?.statusCode ?? 0,
+                    "duration_ms": Int(Date().timeIntervalSince(started) * 1000),
+                    "outcome": outcome
+                ]
+                if let data, let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    record["usage"] = root["usage"]
+                    record["provider_request_id"] = root["id"]
+                    if let choices = root["choices"] as? [[String: Any]] {
+                        record["finish_reason"] = choices.first?["finish_reason"]
+                    }
+                }
+                self.queue.async { self.recordCall(record) }
+            }
             if let error { completion(.failure(error)); return }
             guard let http = response as? HTTPURLResponse, let data else {
                 completion(.failure(MonitorError.analysisFailed)); return
@@ -547,6 +646,7 @@ final class TiboMonitor {
                   digest.sourcePostID == nil || posts.contains(where: { $0.id == digest.sourcePostID }) else {
                 completion(.failure(MonitorError.analysisFailed)); return
             }
+            outcome = "success"
             completion(.success(digest))
         }.resume()
     }
@@ -564,14 +664,35 @@ final class TiboMonitor {
         guard let data = try? JSONEncoder().encode(snapshot) else { return }
         try? data.write(to: cacheURL, options: .atomic)
     }
+
+    private func saveQueryCache() {
+        guard let data = try? JSONEncoder().encode(queryCache) else { return }
+        try? data.write(to: queryCacheURL, options: .atomic)
+    }
+
+    private func recordCall(_ fields: [String: Any]) {
+        var record = fields
+        record["timestamp"] = ISO8601DateFormatter().string(from: Date())
+        guard var data = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]) else { return }
+        data.append(10)
+        if !FileManager.default.fileExists(atPath: callLogURL.path) {
+            FileManager.default.createFile(atPath: callLogURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
+        }
+        guard let file = try? FileHandle(forWritingTo: callLogURL) else { return }
+        defer { try? file.close() }
+        _ = try? file.seekToEnd()
+        try? file.write(contentsOf: data)
+    }
 }
 
 private enum MonitorError: Error {
     case invalidResponse, noPosts, staleTimeline, invalidRequest, analysisFailed
     case apiRejected(Int)
+    case inputBudgetExceeded
 
     var displayMessage: String {
         switch self {
+        case .inputBudgetExceeded: return "公开证据超过单次 96 KB 输入预算，已暂停本次分析以避免额外消耗。"
         case .apiRejected(402): return "AI 服务余额不足，请充值或在设置中更换可用服务。"
         case .apiRejected(401), .apiRejected(403): return "AI 服务认证失败，请检查 API Key 或权限。"
         case .apiRejected(429): return "AI 服务请求受限，稍后自动重试。"
