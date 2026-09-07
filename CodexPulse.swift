@@ -861,7 +861,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popoverController = StatusPopoverController()
         popoverController.onRefresh = { [weak self] in self?.manualRefresh() }
         popoverController.onOpenDashboard = { [weak self] in self?.popover.performClose(nil); self?.showStats() }
-        popoverController.onOpenTibo = { NSWorkspace.shared.open(URL(string: "https://x.com/thsottiaux")!) }
+        popoverController.onOpenTibo = { [weak self] in
+            guard let url = URL(string: self?.tiboSnapshot.sourceURL ?? "https://x.com/thsottiaux") else { return }
+            NSWorkspace.shared.open(url)
+        }
         popoverController.onConfigureAI = { [weak self] in self?.showAIConfiguration() }
         popoverController.onRefreshTibo = { [weak self] in self?.refreshTibo() }
         popoverController.onQuit = { NSApp.terminate(nil) }

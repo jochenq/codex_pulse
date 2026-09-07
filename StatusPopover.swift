@@ -48,7 +48,7 @@ final class StatusPopoverController: NSViewController {
         root.state = .active
         root.translatesAutoresizingMaskIntoConstraints = false
         view = root
-        preferredContentSize = NSSize(width: 398, height: 600)
+        preferredContentSize = NSSize(width: 398, height: 567)
 
         let content = NSStackView()
         content.orientation = .vertical
@@ -136,8 +136,9 @@ final class StatusPopoverController: NSViewController {
     func updateTibo(_ snapshot: TiboActivitySnapshot) {
         latestTiboSnapshot = snapshot
         tiboStateLabel.stringValue = displayTiboState(snapshot)
-        tiboHeadline.stringValue = displayTiboHeadline(snapshot.headline)
+        tiboHeadline.stringValue = snapshot.headline
         tiboSummary.stringValue = snapshot.summary
+        tiboMeta.toolTip = snapshot.analysisError
         if let reply = snapshot.latestReplyText, !reply.isEmpty {
             tiboReply.stringValue = "最新回复 · " + reply
             tiboReply.isHidden = false
@@ -145,12 +146,19 @@ final class StatusPopoverController: NSViewController {
             tiboReply.isHidden = true
         }
         tiboLocalTime.stringValue = tiboPlaceAndTime(snapshot)
+        tiboStateLabel.isHidden = true
+        tiboReply.isHidden = true
+        tiboLocalTime.isHidden = true
         loadTiboAvatar(snapshot.avatarURL)
         let checked = snapshot.checkedAt == .distantPast ? "尚未检查" : "检查于 \(timeOnly(snapshot.checkedAt))"
         let latest = snapshot.latestPostAt.map { " · 最近发帖 \(shortActivityDate($0))" } ?? ""
         switch snapshot.status {
         case "current":
-            tiboMeta.stringValue = checked + latest
+            tiboMeta.stringValue = "中文分析 · " + checked + latest
+        case "analysis-error":
+            tiboMeta.stringValue = snapshot.analyzedAt == nil
+                ? "中文分析失败，将自动重试 · " + checked
+                : "更新失败，保留上次中文分析 · " + checked
         case "current-fallback":
             tiboMeta.stringValue = "原文回退 · " + checked + latest
         case "loading":
@@ -234,7 +242,7 @@ final class StatusPopoverController: NSViewController {
         let content = NSStackView(); content.orientation = .vertical; content.alignment = .leading; content.spacing = 5; content.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(content)
         NSLayoutConstraint.activate([
-            card.heightAnchor.constraint(equalToConstant: 158),
+            card.heightAnchor.constraint(equalToConstant: 125),
             content.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 13),
             content.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -13),
             content.topAnchor.constraint(equalTo: card.topAnchor, constant: 10),
@@ -248,6 +256,8 @@ final class StatusPopoverController: NSViewController {
         NSLayoutConstraint.activate([tiboAvatar.widthAnchor.constraint(equalToConstant: 22), tiboAvatar.heightAnchor.constraint(equalToConstant: 22)])
         header.addArrangedSubview(tiboAvatar)
         header.addArrangedSubview(tiboSectionTitle)
+        tiboSectionTitle.stringValue = "Tibo · 重置消息"
+        tiboStateLabel.isHidden = true
         header.addArrangedSubview(tiboStateLabel)
         let settings = iconButton("slider.horizontal.3", toolTip: "配置 Tibo AI", action: #selector(configureAI))
         settings.controlSize = .small
@@ -272,8 +282,6 @@ final class StatusPopoverController: NSViewController {
         tiboSummary.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         content.addArrangedSubview(tiboSummary); tiboSummary.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
         tiboReply.lineBreakMode = .byTruncatingTail
-        content.addArrangedSubview(tiboReply); tiboReply.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
-        content.addArrangedSubview(tiboLocalTime)
         content.addArrangedSubview(tiboMeta)
         return card
     }
