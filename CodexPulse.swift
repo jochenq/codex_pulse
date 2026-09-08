@@ -835,6 +835,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var timer: Timer?
     private var tiboTimer: Timer?
     private var liveTimer: Timer?
+    private let tiboAutomaticRefreshInterval: TimeInterval = 60 * 60
     private var isRefreshing = false
     private var queuedManualRefresh = false
     private var isLivePolling = false
@@ -880,7 +881,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refresh()
         refreshTibo()
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.refresh() }
-        tiboTimer = Timer.scheduledTimer(withTimeInterval: 5 * 60, repeats: true) { [weak self] _ in self?.refreshTibo() }
+        tiboTimer = Timer.scheduledTimer(withTimeInterval: tiboAutomaticRefreshInterval, repeats: true) { [weak self] _ in
+            self?.refreshTibo()
+        }
         liveTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.pollLiveMetrics() }
         if CommandLine.arguments.contains("--show-stats") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.showStats() }
