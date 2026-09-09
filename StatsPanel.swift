@@ -39,6 +39,22 @@ private enum MetricCardStyle {
     case secondary
 }
 
+private enum StatsDateRange: Int {
+    case today
+    case yesterday
+    case dayBeforeYesterday
+    case last7Days
+    case last30Days
+    case allTime
+    case custom
+}
+
+private struct StatsDateBounds {
+    let start: Date?
+    let end: Date?
+    let includesEnd: Bool
+}
+
 final class StatsWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
     private var allRecords: [RequestMetric] = []
     private var apiCalls: [APICallMetric] = []
@@ -65,6 +81,8 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
     private lazy var nextPageButton = ClickableButton(title: "下一页 ›", target: self, action: #selector(nextConsolePage))
     private let consolePageSize = 100
     private var consolePage = 0
+    private var customDateBounds: StatsDateBounds?
+    private var lastAppliedRangeIndex = StatsDateRange.today.rawValue
 
     var isLiveConsoleVisible: Bool {
         window?.isVisible == true && (tabs.selectedTabViewItem?.identifier as? String) == "console"
@@ -141,10 +159,10 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         titleStack.alignment = .leading
         titleStack.spacing = 3
 
-        rangePopup.addItems(withTitles: ["今日", "最近 7 天", "最近 30 天", "全部时间"])
+        rangePopup.addItems(withTitles: ["今日", "昨天", "前天", "最近 7 天", "最近 30 天", "全部时间", "自选范围…"])
         rangePopup.selectItem(at: 0)
         rangePopup.target = self
-        rangePopup.action = #selector(filterChanged)
+        rangePopup.action = #selector(rangeChanged)
         modelPopup.target = self
         modelPopup.action = #selector(filterChanged)
         effortPopup.target = self
@@ -400,34 +418,144 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
 
     @objc private func filterChanged() { applyFilters() }
 
+    @objc private func rangeChanged() {
+        guard rangePopup.indexOfSelectedItem == StatsDateRange.custom.rawValue else {
+            lastAppliedRangeIndex = rangePopup.indexOfSelectedItem
+            rangePopup.toolTip = nil
+            applyFilters()
+            return
+        }
+        presentCustomRangePicker()
+    }
+
+    private func presentCustomRangePicker() {
+        let calendar = Calendar.current
+        let initialStart = customDateBounds?.start ?? calendar.startOfDay(for: Date())
+        let initialEnd = customDateBounds?.end ?? Date()
+        let startPicker = dateTimePicker(initialStart)
+        let endPicker = dateTimePicker(initialEnd)
+        let fields = NSStackView(views: [labeledControl("开始时间", startPicker), labeledControl("结束时间", endPicker)])
+        fields.orientation = .vertical
+        fields.alignment = .leading
+        fields.spacing = 10
+        fields.translatesAutoresizingMaskIntoConstraints = false
+        let accessory = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 92))
+        accessory.addSubview(fields)
+        NSLayoutConstraint.activate([
+            fields.leadingAnchor.constraint(equalTo: accessory.leadingAnchor),
+            fields.trailingAnchor.constraint(equalTo: accessory.trailingAnchor),
+            fields.topAnchor.constraint(equalTo: accessory.topAnchor),
+            fields.bottomAnchor.constraint(equalTo: accessory.bottomAnchor)
+        ])
+
+        let alert = NSAlert()
+        alert.messageText = "选择统计时间范围"
+        alert.informativeText = "开始和结束时间均按当前系统时区计算。"
+        alert.accessoryView = accessory
+        alert.addButton(withTitle: "应用")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            rangePopup.selectItem(at: lastAppliedRangeIndex)
+            return
+        }
+        guard startPicker.dateValue <= endPicker.dateValue else {
+            rangePopup.selectItem(at: lastAppliedRangeIndex)
+            let error = NSAlert()
+            error.alertStyle = .warning
+            error.messageText = "时间范围无效"
+            error.informativeText = "开始时间不能晚于结束时间。"
+            error.runModal()
+            return
+        }
+        customDateBounds = StatsDateBounds(start: startPicker.dateValue, end: endPicker.dateValue, includesEnd: true)
+        lastAppliedRangeIndex = StatsDateRange.custom.rawValue
+        rangePopup.item(at: StatsDateRange.custom.rawValue)?.title = customRangeTitle(start: startPicker.dateValue, end: endPicker.dateValue)
+        rangePopup.toolTip = "自选范围：\(fullDateTime(startPicker.dateValue)) 至 \(fullDateTime(endPicker.dateValue))"
+        rangePopup.selectItem(at: StatsDateRange.custom.rawValue)
+        applyFilters()
+    }
+
+    private func dateTimePicker(_ date: Date) -> NSDatePicker {
+        let picker = NSDatePicker()
+        picker.datePickerStyle = .textFieldAndStepper
+        picker.datePickerElements = [.yearMonthDay, .hourMinuteSecond]
+        picker.locale = Locale(identifier: "zh_CN")
+        picker.timeZone = .current
+        picker.dateValue = date
+        picker.translatesAutoresizingMaskIntoConstraints = false
+        picker.widthAnchor.constraint(equalToConstant: 300).isActive = true
+        return picker
+    }
+
+    private func customRangeTitle(start: Date, end: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.timeZone = .current
+        formatter.dateFormat = "M/d HH:mm"
+        return "自选 \(formatter.string(from: start)) – \(formatter.string(from: end))"
+    }
+
+    private func fullDateTime(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return formatter.string(from: date)
+    }
+
+    private func selectedDateBounds() -> StatsDateBounds {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        let tomorrow = calendar.date(byAdding: .day, value: 1, to: today) ?? Date.distantFuture
+        switch StatsDateRange(rawValue: rangePopup.indexOfSelectedItem) ?? .today {
+        case .today:
+            return StatsDateBounds(start: today, end: tomorrow, includesEnd: false)
+        case .yesterday:
+            return StatsDateBounds(start: calendar.date(byAdding: .day, value: -1, to: today), end: today, includesEnd: false)
+        case .dayBeforeYesterday:
+            return StatsDateBounds(start: calendar.date(byAdding: .day, value: -2, to: today),
+                                   end: calendar.date(byAdding: .day, value: -1, to: today), includesEnd: false)
+        case .last7Days:
+            return StatsDateBounds(start: calendar.date(byAdding: .day, value: -6, to: today), end: tomorrow, includesEnd: false)
+        case .last30Days:
+            return StatsDateBounds(start: calendar.date(byAdding: .day, value: -29, to: today), end: tomorrow, includesEnd: false)
+        case .allTime:
+            return StatsDateBounds(start: nil, end: nil, includesEnd: false)
+        case .custom:
+            return customDateBounds ?? StatsDateBounds(start: today, end: Date(), includesEnd: true)
+        }
+    }
+
     private func applyFilters() {
         let model = modelPopup.titleOfSelectedItem ?? "全部模型"
         let effort = effortPopup.titleOfSelectedItem ?? "全部等级"
-        let calendar = Calendar.current
-        let today = calendar.startOfDay(for: Date())
-        let cutoff: Date?
-        switch rangePopup.indexOfSelectedItem {
-        case 0:
-            cutoff = today
+        let dateBounds = selectedDateBounds()
+        switch StatsDateRange(rawValue: rangePopup.indexOfSelectedItem) ?? .today {
+        case .today:
             chartTitleLabel.stringValue = "今日 Token"
             chartHeightConstraint?.constant = 96
-        case 1:
-            cutoff = calendar.date(byAdding: .day, value: -6, to: today)
-            chartTitleLabel.stringValue = "每日 Token 趋势"
+        case .yesterday:
+            chartTitleLabel.stringValue = "昨天 Token"
+            chartHeightConstraint?.constant = 96
+        case .dayBeforeYesterday:
+            chartTitleLabel.stringValue = "前天 Token"
+            chartHeightConstraint?.constant = 96
+        case .custom:
+            chartTitleLabel.stringValue = "自选范围 Token 趋势"
             chartHeightConstraint?.constant = 128
-        case 2:
-            cutoff = calendar.date(byAdding: .day, value: -29, to: today)
-            chartTitleLabel.stringValue = "每日 Token 趋势"
-            chartHeightConstraint?.constant = 128
-        default:
-            cutoff = nil
+        case .last7Days, .last30Days, .allTime:
             chartTitleLabel.stringValue = "每日 Token 趋势"
             chartHeightConstraint?.constant = 128
         }
         filteredRecords = allRecords.filter { record in
             if model != "全部模型" && record.model != model { return false }
             if effort != "全部等级" && record.effort != effort { return false }
-            if let cutoff, let date = metricDate(record.timestamp), date < cutoff { return false }
+            if dateBounds.start != nil || dateBounds.end != nil {
+                guard let date = metricDate(record.timestamp) else { return false }
+                if let start = dateBounds.start, date < start { return false }
+                if let end = dateBounds.end,
+                   (dateBounds.includesEnd ? date > end : date >= end) { return false }
+            }
             return true
         }
         groupRows = grouped(filteredRecords)
@@ -585,16 +713,21 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         let dated = records.compactMap { record -> (Date, RequestMetric)? in
             metricDate(record.timestamp).map { (calendar.startOfDay(for: $0), record) }
         }
-        guard !dated.isEmpty else { return [] }
         let grouped = Dictionary(grouping: dated, by: { $0.0 })
-        let latest = dated.map(\.0).max() ?? calendar.startOfDay(for: Date())
-        let requestedDays: Int
-        switch rangePopup.indexOfSelectedItem {
-        case 0: requestedDays = 1
-        case 1: requestedDays = 7
-        default: requestedDays = 30
+        let selection = StatsDateRange(rawValue: rangePopup.indexOfSelectedItem) ?? .today
+        let bounds = selectedDateBounds()
+        let earliest: Date
+        let latest: Date
+        if selection == .allTime {
+            guard let latestRecordDay = dated.map(\.0).max() else { return [] }
+            latest = latestRecordDay
+            earliest = calendar.date(byAdding: .day, value: -29, to: latest) ?? latest
+        } else {
+            guard let start = bounds.start, let end = bounds.end else { return [] }
+            earliest = calendar.startOfDay(for: start)
+            let inclusiveEnd = bounds.includesEnd ? end : end.addingTimeInterval(-1)
+            latest = calendar.startOfDay(for: max(start, inclusiveEnd))
         }
-        let earliest = calendar.date(byAdding: .day, value: -(requestedDays - 1), to: latest) ?? latest
         var points: [DailyPoint] = []
         var date = earliest
         while date <= latest {
