@@ -31,6 +31,11 @@ private struct ConsoleRow {
     let timestamp: String
     let model: String
     let effort: String
+    let serviceTier: String?
+    let ttftMS: Int?
+    let ttftEstimated: Bool?
+    let durationMS: Int?
+    let durationEstimated: Bool?
     let usage: TokenUsage?
 }
 
@@ -384,7 +389,9 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         addColumns([
             ("api_status", "状态", 64), ("api_time", "时间", 124),
             ("api_session", "会话", 124), ("api_model", "模型", 112),
-            ("api_effort", "等级", 55), ("api_input", "输入", 64),
+            ("api_effort", "等级", 55), ("api_fast", "Fast", 48),
+            ("api_ttft", "首 Token", 72), ("api_duration", "总时长", 72),
+            ("api_input", "输入", 64),
             ("api_cached", "缓存", 64), ("api_output", "输出", 60),
             ("api_reasoning", "推理", 60), ("api_total", "总 Token", 70),
             ("api_value", "价值", 74)
@@ -603,7 +610,10 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
                     rows.append(ConsoleRow(id: call.id, status: call.status,
                                            sessionName: sessionTitles[call.sessionID] ?? call.sessionID,
                                            timestamp: call.timestamp, model: call.model,
-                                           effort: call.effort, usage: nil))
+                                           effort: call.effort, serviceTier: call.serviceTier,
+                                           ttftMS: call.ttftMS, ttftEstimated: call.ttftEstimated,
+                                           durationMS: call.durationMS, durationEstimated: call.durationEstimated,
+                                           usage: nil))
                 }
                 activeIndex += 1
             } else {
@@ -612,7 +622,10 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
                     rows.append(ConsoleRow(id: call.id, status: nil,
                                            sessionName: sessionTitles[call.sessionID] ?? call.sessionID,
                                            timestamp: call.timestamp, model: call.model,
-                                           effort: call.effort, usage: call.usage))
+                                           effort: call.effort, serviceTier: call.serviceTier,
+                                           ttftMS: call.ttftMS, ttftEstimated: call.ttftEstimated,
+                                           durationMS: call.durationMS, durationEstimated: call.durationEstimated,
+                                           usage: call.usage))
                 }
                 completedIndex += 1
             }
@@ -795,6 +808,9 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         case "api_session": value = compactSessionTitle(item.sessionName)
         case "api_model": value = item.model
         case "api_effort": value = item.effort
+        case "api_fast": value = fastTierLabel(item.serviceTier)
+        case "api_ttft": value = timingLabel(item.ttftMS, estimated: item.ttftEstimated)
+        case "api_duration": value = timingLabel(item.durationMS, estimated: item.durationEstimated)
         case "api_input": value = usage.map { compactNumber($0.input) } ?? "--"
         case "api_cached": value = usage.map { compactNumber($0.cached) } ?? "--"
         case "api_output": value = usage.map { compactNumber($0.output) } ?? "--"
@@ -804,12 +820,21 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         default: value = ""
         }
         cell.textField?.stringValue = value
-        cell.textField?.alignment = ["api_input", "api_cached", "api_output", "api_reasoning", "api_total", "api_value"].contains(id.rawValue) ? .right : .left
+        cell.textField?.alignment = ["api_ttft", "api_duration", "api_input", "api_cached", "api_output", "api_reasoning", "api_total", "api_value"].contains(id.rawValue) ? .right : .left
         cell.textField?.textColor = id.rawValue == "api_status" ? (item.status != nil ? .controlAccentColor : .secondaryLabelColor) : .labelColor
         if id.rawValue == "api_session" {
             cell.toolTip = item.sessionName
         } else if id.rawValue == "api_time" {
             cell.toolTip = item.timestamp
+        } else if id.rawValue == "api_fast" {
+            cell.toolTip = item.serviceTier.map { "Codex service tier：\($0)" } ?? "旧记录未包含 service tier"
+        } else if id.rawValue == "api_ttft" {
+            cell.toolTip = item.ttftMS.map {
+                item.ttftEstimated == true ? "根据本地事件边界推算的首响应：\($0)ms" : "Codex 记录的首 Token：\($0)ms"
+            } ?? "本次调用缺少可关联的首响应时间"
+        } else if id.rawValue == "api_duration" {
+            cell.toolTip = item.durationMS.map { "根据本地事件边界推算的模型调用总时长：\($0)ms" }
+                ?? "本次调用缺少可关联的结束时间"
         } else if let usage, ["api_input", "api_cached", "api_output", "api_reasoning", "api_total"].contains(id.rawValue) {
             let exact: Int = id.rawValue == "api_input" ? usage.input : id.rawValue == "api_cached" ? usage.cached : id.rawValue == "api_output" ? usage.output : id.rawValue == "api_reasoning" ? usage.reasoning : usage.total
             cell.toolTip = fullNumber(exact) + " Token"
@@ -1025,6 +1050,20 @@ private func formatDuration(_ milliseconds: Int) -> String {
     let remainder = Int(seconds) % 60
     if minutes < 60 { return "\(minutes)m \(remainder)s" }
     return "\(minutes / 60)h \(minutes % 60)m"
+}
+
+private func fastTierLabel(_ serviceTier: String?) -> String {
+    switch serviceTier?.lowercased() {
+    case "priority", "fast": return "是"
+    case "default": return "否"
+    case .some(let value): return value
+    case .none: return "--"
+    }
+}
+
+private func timingLabel(_ milliseconds: Int?, estimated: Bool?) -> String {
+    guard let milliseconds else { return "--" }
+    return (estimated == true ? "≈ " : "") + formatDuration(milliseconds)
 }
 
 private func elapsedMS(since timestamp: String) -> Int {

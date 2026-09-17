@@ -39,6 +39,11 @@ struct APICallMetric: Codable {
     let timestamp: String
     let model: String
     let effort: String
+    let serviceTier: String?
+    var ttftMS: Int?
+    var ttftEstimated: Bool?
+    let durationMS: Int?
+    let durationEstimated: Bool?
     let usage: TokenUsage
     let source: String
 }
@@ -50,6 +55,11 @@ struct ActiveAPICall {
     let timestamp: String
     let model: String
     let effort: String
+    let serviceTier: String?
+    let ttftMS: Int?
+    let ttftEstimated: Bool?
+    let durationMS: Int?
+    let durationEstimated: Bool?
     let status: String
     let source: String
 }
@@ -65,7 +75,10 @@ private struct PendingTurn {
 }
 
 private struct PendingAPIState {
-    var timestamp: String
+    var startTimestamp: String
+    var firstResponseTimestamp: String?
+    var lastResponseTimestamp: String?
+    var serviceTier: String?
     var status: String
 }
 
@@ -91,6 +104,8 @@ final class MetricStore {
     private let usageMigrationKey = "turn-token-usage-delta-v1"
     private let modelCallMigrationKey = "turn-model-call-count-v1"
     private let apiCallMigrationKey = "api-call-records-v1"
+    private let apiCallDetailsMigrationKey = "api-call-details-v2"
+    private let apiCallItemTimingMigrationKey = "api-call-item-timing-v3"
 
     var liveRequests: [LiveRequest] {
         let cutoff = Date().addingTimeInterval(-6 * 60 * 60)
@@ -202,7 +217,9 @@ final class MetricStore {
     func importCodexHistory() -> Int {
         if !UserDefaults.standard.bool(forKey: usageMigrationKey)
             || !UserDefaults.standard.bool(forKey: modelCallMigrationKey)
-            || !UserDefaults.standard.bool(forKey: apiCallMigrationKey) {
+            || !UserDefaults.standard.bool(forKey: apiCallMigrationKey)
+            || !UserDefaults.standard.bool(forKey: apiCallDetailsMigrationKey)
+            || !UserDefaults.standard.bool(forKey: apiCallItemTimingMigrationKey) {
             return rebuildAllHistoryWithTurnDeltas()
         }
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -292,6 +309,8 @@ final class MetricStore {
         UserDefaults.standard.set(true, forKey: usageMigrationKey)
         UserDefaults.standard.set(true, forKey: modelCallMigrationKey)
         UserDefaults.standard.set(true, forKey: apiCallMigrationKey)
+        UserDefaults.standard.set(true, forKey: apiCallDetailsMigrationKey)
+        UserDefaults.standard.set(true, forKey: apiCallItemTimingMigrationKey)
         return records.count
     }
 
@@ -301,18 +320,22 @@ final class MetricStore {
         }
         var pending: PendingTurn?
         var pendingAPIState: PendingAPIState?
+        var completedAPIStateAwaitingUsage: PendingAPIState?
         var result: [RequestMetric] = []
         var apiCallResult: [APICallMetric] = []
         var sessionID = file.deletingPathExtension().lastPathComponent.split(separator: "-").last.map(String.init) ?? file.lastPathComponent
         var lastModel: String?
         var lastEffort: String?
+        var lastServiceTier: String?
         var sessionUsage = TokenUsage()
+        var latestTimestamp = ""
 
         for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
             guard let data = line.data(using: .utf8),
                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let type = object["type"] as? String else { continue }
             let timestamp = object["timestamp"] as? String ?? ""
+            if !timestamp.isEmpty { latestTimestamp = timestamp }
             guard let payload = object["payload"] as? [String: Any] else { continue }
 
             if type == "session_meta" {
@@ -329,7 +352,11 @@ final class MetricStore {
                         turn.effort = lastEffort ?? turn.effort
                         turn.baselineUsage = sessionUsage
                         pending = turn
-                        pendingAPIState = PendingAPIState(timestamp: timestamp, status: "请求中")
+                        pendingAPIState = PendingAPIState(startTimestamp: timestamp,
+                                                         firstResponseTimestamp: nil,
+                                                         lastResponseTimestamp: nil,
+                                                         serviceTier: lastServiceTier,
+                                                         status: "请求中")
                     }
                 case "token_count":
                     guard var turn = pending,
@@ -347,9 +374,19 @@ final class MetricStore {
                     if let lastUsage = info["last_token_usage"] as? [String: Any],
                        int(lastUsage["total_tokens"]) > 0 {
                         turn.modelCalls += 1
+                        let timing = completedAPIStateAwaitingUsage ?? pendingAPIState
+                        let inferredTTFT = apiElapsedMS(from: timing?.startTimestamp,
+                                                       to: timing?.firstResponseTimestamp)
+                        let inferredDuration = apiElapsedMS(from: timing?.startTimestamp,
+                                                           to: timing?.lastResponseTimestamp)
                         apiCallResult.append(APICallMetric(
                             id: "\(sessionID):\(timestamp)", sessionID: sessionID, turnID: turn.id,
                             timestamp: timestamp, model: turn.model, effort: turn.effort,
+                            serviceTier: timing?.serviceTier,
+                            ttftMS: inferredTTFT,
+                            ttftEstimated: inferredTTFT == nil ? nil : true,
+                            durationMS: inferredDuration,
+                            durationEstimated: inferredDuration == nil ? nil : true,
                             usage: TokenUsage(
                                 input: int(lastUsage["input_tokens"]),
                                 cached: int(lastUsage["cached_input_tokens"]),
@@ -359,13 +396,26 @@ final class MetricStore {
                             ),
                             source: file.path
                         ))
-                        pendingAPIState = PendingAPIState(timestamp: timestamp, status: "请求中")
+                        if completedAPIStateAwaitingUsage != nil {
+                            completedAPIStateAwaitingUsage = nil
+                        } else {
+                            pendingAPIState = PendingAPIState(startTimestamp: timestamp,
+                                                             firstResponseTimestamp: nil,
+                                                             lastResponseTimestamp: nil,
+                                                             serviceTier: lastServiceTier,
+                                                             status: "请求中")
+                        }
                     }
                     pending = turn
                 case "task_complete":
                     guard let turn = pending,
                           let id = payload["turn_id"] as? String,
                           id == turn.id else { continue }
+                    if let firstCallIndex = apiCallResult.firstIndex(where: { $0.turnID == id }),
+                       int(payload["time_to_first_token_ms"]) > 0 {
+                        apiCallResult[firstCallIndex].ttftMS = int(payload["time_to_first_token_ms"])
+                        apiCallResult[firstCallIndex].ttftEstimated = false
+                    }
                     result.append(RequestMetric(
                         turnID: id,
                         timestamp: turn.timestamp.isEmpty ? timestamp : turn.timestamp,
@@ -379,6 +429,29 @@ final class MetricStore {
                     ))
                     pending = nil
                     pendingAPIState = nil
+                    completedAPIStateAwaitingUsage = nil
+                case "item_completed":
+                    guard let item = payload["item"] as? [String: Any],
+                          let itemType = item["type"] as? String,
+                          ["Reasoning", "AgentMessage"].contains(itemType) else { break }
+                    let first = apiEventTimestamp(milliseconds: payload["started_at_ms"]) ?? timestamp
+                    let last = apiEventTimestamp(milliseconds: payload["completed_at_ms"]) ?? timestamp
+                    markAPIResponse(&pendingAPIState, firstTimestamp: first,
+                                    lastTimestamp: last, status: "响应中")
+                case "thread_settings_applied":
+                    guard let settings = payload["thread_settings"] as? [String: Any] else { break }
+                    if let model = settings["model"] as? String { lastModel = model }
+                    if let effort = settings["reasoning_effort"] as? String { lastEffort = effort }
+                    if let tier = settings["service_tier"] as? String { lastServiceTier = tier }
+                    if var turn = pending {
+                        turn.model = lastModel ?? turn.model
+                        turn.effort = lastEffort ?? turn.effort
+                        pending = turn
+                    }
+                    if var apiState = pendingAPIState, apiState.firstResponseTimestamp == nil {
+                        apiState.serviceTier = lastServiceTier
+                        pendingAPIState = apiState
+                    }
                 default:
                     break
                 }
@@ -394,13 +467,24 @@ final class MetricStore {
             } else if type == "response_item", pending != nil, let itemType = payload["type"] as? String {
                 switch itemType {
                 case "custom_tool_call", "function_call":
-                    pendingAPIState?.status = "工具中"
+                    markAPIResponse(&pendingAPIState, firstTimestamp: timestamp,
+                                    lastTimestamp: timestamp, status: "工具中")
                 case "custom_tool_call_output", "function_call_output":
-                    pendingAPIState = PendingAPIState(timestamp: timestamp, status: "请求中")
+                    if completedAPIStateAwaitingUsage == nil,
+                       pendingAPIState?.lastResponseTimestamp != nil {
+                        completedAPIStateAwaitingUsage = pendingAPIState
+                    }
+                    pendingAPIState = PendingAPIState(startTimestamp: timestamp,
+                                                     firstResponseTimestamp: nil,
+                                                     lastResponseTimestamp: nil,
+                                                     serviceTier: lastServiceTier,
+                                                     status: "请求中")
                 case "reasoning":
-                    pendingAPIState?.status = "响应中"
+                    markAPIResponse(&pendingAPIState, firstTimestamp: timestamp,
+                                    lastTimestamp: timestamp, status: "响应中")
                 case "message" where (payload["role"] as? String) == "assistant":
-                    pendingAPIState?.status = "响应中"
+                    markAPIResponse(&pendingAPIState, firstTimestamp: timestamp,
+                                    lastTimestamp: timestamp, status: "响应中")
                 default:
                     break
                 }
@@ -419,9 +503,15 @@ final class MetricStore {
         }
         let activeAPI = pending.flatMap { turn in
             pendingAPIState.map {
-                ActiveAPICall(id: "active:\(sessionID):\(turn.id):\($0.timestamp)", sessionID: sessionID,
-                              turnID: turn.id, timestamp: $0.timestamp, model: turn.model,
-                              effort: turn.effort, status: $0.status, source: file.path)
+                let endTimestamp = $0.lastResponseTimestamp ?? latestTimestamp
+                return ActiveAPICall(id: "active:\(sessionID):\(turn.id):\($0.startTimestamp)", sessionID: sessionID,
+                                     turnID: turn.id, timestamp: $0.startTimestamp, model: turn.model,
+                                     effort: turn.effort, serviceTier: $0.serviceTier,
+                                     ttftMS: apiElapsedMS(from: $0.startTimestamp, to: $0.firstResponseTimestamp),
+                                     ttftEstimated: $0.firstResponseTimestamp == nil ? nil : true,
+                                     durationMS: apiElapsedMS(from: $0.startTimestamp, to: endTimestamp),
+                                     durationEstimated: true,
+                                     status: $0.status, source: file.path)
             }
         }
         return ParseResult(completed: result, pending: live, apiCalls: apiCallResult, activeAPI: activeAPI)
@@ -489,6 +579,30 @@ final class MetricStore {
             try? handle.write(contentsOf: data + Data([0x0a]))
         }
     }
+}
+
+private func markAPIResponse(_ state: inout PendingAPIState?, firstTimestamp: String,
+                             lastTimestamp: String, status: String) {
+    guard var value = state else { return }
+    if value.firstResponseTimestamp == nil { value.firstResponseTimestamp = firstTimestamp }
+    value.lastResponseTimestamp = lastTimestamp
+    value.status = status
+    state = value
+}
+
+private func apiEventTimestamp(milliseconds value: Any?) -> String? {
+    let milliseconds: Double
+    if let number = value as? NSNumber { milliseconds = number.doubleValue }
+    else if let text = value as? String, let number = Double(text) { milliseconds = number }
+    else { return nil }
+    return isoFormatter.string(from: Date(timeIntervalSince1970: milliseconds / 1_000))
+}
+
+private func apiElapsedMS(from start: String?, to end: String?) -> Int? {
+    guard let start, let end,
+          let startDate = requestMetricDate(start),
+          let endDate = requestMetricDate(end) else { return nil }
+    return max(0, Int((endDate.timeIntervalSince(startDate) * 1_000).rounded()))
 }
 
 final class RateLimitReader {
