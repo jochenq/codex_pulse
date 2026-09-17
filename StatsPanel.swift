@@ -14,6 +14,7 @@ private struct GroupStats {
     let typicalTTFT: Int
     let slowerTTFT: Int
     let averageDuration: Int
+    let tokenRate: Double?
 
     var cacheRate: Double { input > 0 ? Double(cached) / Double(input) : 0 }
 }
@@ -36,6 +37,7 @@ private struct ConsoleRow {
     let ttftEstimated: Bool?
     let durationMS: Int?
     let durationEstimated: Bool?
+    let tokenRate: Double?
     let usage: TokenUsage?
 }
 
@@ -66,6 +68,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
     private var activeAPICalls: [ActiveAPICall] = []
     private var sessionTitles: [String: String] = [:]
     private var filteredRecords: [RequestMetric] = []
+    private var filteredAPICalls: [APICallMetric] = []
     private var groupRows: [GroupStats] = []
     private var consoleRows: [ConsoleRow] = []
 
@@ -192,9 +195,10 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         let value = metricBox("价值相当于", help: "按 OpenAI 标准 API Token 单价估算；不代表订阅套餐的实际账单", style: .primary, highlighted: true)
         let typical = metricBox("典型首响应", help: "一半请求的首响应时间不超过这个值", style: .secondary)
         let slower = metricBox("P95 总耗时", help: "95% 的请求总耗时不超过这个值", style: .secondary)
+        let tokenRate = metricBox("Token 速率", help: "已完成调用的输出 Token ÷ 出字阶段耗时（总时长 − 首 Token）", style: .secondary)
         let cache = metricBox("缓存命中率", help: "输入 Token 中由缓存直接复用的比例", style: .secondary)
         let reasoning = metricBox("推理占比", help: "输出 Token 中用于模型推理的比例", style: .secondary)
-        summaryValues = [calls.1, total.1, value.1, typical.1, slower.1, cache.1, reasoning.1]
+        summaryValues = [calls.1, total.1, value.1, typical.1, slower.1, tokenRate.1, cache.1, reasoning.1]
 
         let primaryCards = [total.0, value.0, calls.0]
         let primaryGrid = NSGridView(views: [primaryCards])
@@ -202,7 +206,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         for index in primaryCards.indices { primaryGrid.column(at: index).xPlacement = .fill }
         for card in primaryCards.dropFirst() { card.widthAnchor.constraint(equalTo: primaryCards[0].widthAnchor).isActive = true }
 
-        let secondaryCards = [typical.0, slower.0, cache.0, reasoning.0]
+        let secondaryCards = [typical.0, slower.0, tokenRate.0, cache.0, reasoning.0]
         let secondaryGrid = NSGridView(views: [secondaryCards])
         secondaryGrid.columnSpacing = 8
         for index in secondaryCards.indices { secondaryGrid.column(at: index).xPlacement = .fill }
@@ -376,6 +380,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
             ("group", "模型 / 推理等级", 185), ("count", "API 请求", 78),
             ("total", "总 Token", 82), ("value", "价值相当于", 90), ("input", "输入", 78),
             ("output", "输出", 70), ("reasoning", "推理", 70),
+            ("rate", "Token 速率", 86),
             ("typical", "典型首响应", 92), ("slower", "较慢首响应", 92),
             ("duration", "平均耗时", 82), ("cache", "缓存命中", 78)
         ], to: tableView)
@@ -391,6 +396,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
             ("api_session", "会话", 124), ("api_model", "模型", 112),
             ("api_effort", "等级", 55), ("api_fast", "Fast", 48),
             ("api_ttft", "首 Token", 72), ("api_duration", "总时长", 72),
+            ("api_rate", "Token 速率", 86),
             ("api_input", "输入", 64),
             ("api_cached", "缓存", 64), ("api_output", "输出", 60),
             ("api_reasoning", "推理", 60), ("api_total", "总 Token", 70),
@@ -533,6 +539,14 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         }
     }
 
+    private func timestamp(_ value: String, isWithin bounds: StatsDateBounds) -> Bool {
+        guard bounds.start != nil || bounds.end != nil else { return true }
+        guard let date = metricDate(value) else { return false }
+        if let start = bounds.start, date < start { return false }
+        if let end = bounds.end, bounds.includesEnd ? date > end : date >= end { return false }
+        return true
+    }
+
     private func applyFilters() {
         let model = modelPopup.titleOfSelectedItem ?? "全部模型"
         let effort = effortPopup.titleOfSelectedItem ?? "全部等级"
@@ -557,15 +571,14 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         filteredRecords = allRecords.filter { record in
             if model != "全部模型" && record.model != model { return false }
             if effort != "全部等级" && record.effort != effort { return false }
-            if dateBounds.start != nil || dateBounds.end != nil {
-                guard let date = metricDate(record.timestamp) else { return false }
-                if let start = dateBounds.start, date < start { return false }
-                if let end = dateBounds.end,
-                   (dateBounds.includesEnd ? date > end : date >= end) { return false }
-            }
-            return true
+            return timestamp(record.timestamp, isWithin: dateBounds)
         }
-        groupRows = grouped(filteredRecords)
+        filteredAPICalls = apiCalls.filter { call in
+            if model != "全部模型" && call.model != model { return false }
+            if effort != "全部等级" && call.effort != effort { return false }
+            return timestamp(call.timestamp, isWithin: dateBounds)
+        }
+        groupRows = grouped(filteredRecords, apiCalls: filteredAPICalls)
         updateSummary()
         chartView.points = dailyPoints(filteredRecords)
         tableView.reloadData()
@@ -613,6 +626,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
                                            effort: call.effort, serviceTier: call.serviceTier,
                                            ttftMS: call.ttftMS, ttftEstimated: call.ttftEstimated,
                                            durationMS: call.durationMS, durationEstimated: call.durationEstimated,
+                                           tokenRate: nil,
                                            usage: nil))
                 }
                 activeIndex += 1
@@ -625,6 +639,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
                                            effort: call.effort, serviceTier: call.serviceTier,
                                            ttftMS: call.ttftMS, ttftEstimated: call.ttftEstimated,
                                            durationMS: call.durationMS, durationEstimated: call.durationEstimated,
+                                           tokenRate: tokenRate(for: call),
                                            usage: call.usage))
                 }
                 completedIndex += 1
@@ -683,8 +698,9 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         rebuildConsole(animated: false)
     }
 
-    private func grouped(_ records: [RequestMetric]) -> [GroupStats] {
-        Dictionary(grouping: records) { "\($0.model)\u{1f}\($0.effort)" }.values.map { bucket in
+    private func grouped(_ records: [RequestMetric], apiCalls: [APICallMetric]) -> [GroupStats] {
+        let callsByGroup = Dictionary(grouping: apiCalls) { "\($0.model)\u{1f}\($0.effort)" }
+        return Dictionary(grouping: records) { "\($0.model)\u{1f}\($0.effort)" }.map { key, bucket in
             let first = bucket[0]
             let durations = bucket.map(\.durationMS)
             let ttfts = bucket.map(\.ttftMS).filter { $0 > 0 }
@@ -698,7 +714,8 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
                 total: bucket.reduce(0) { $0 + $1.usage.total },
                 valueUSD: summedAPICost(bucket),
                 typicalTTFT: percentile(ttfts, 0.50), slowerTTFT: percentile(ttfts, 0.95),
-                averageDuration: durations.isEmpty ? 0 : durations.reduce(0, +) / durations.count
+                averageDuration: durations.isEmpty ? 0 : durations.reduce(0, +) / durations.count,
+                tokenRate: aggregateTokenRate(callsByGroup[key] ?? [])
             )
         }.sorted { $0.total > $1.total }
     }
@@ -716,6 +733,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         let values = [compactNumber(modelCalls), compactNumber(total),
                       formatUSD(valueUSD),
                       formatDuration(percentile(ttfts, 0.50)), formatDuration(percentile(durations, 0.95)),
+                      formatTokenRate(aggregateTokenRate(filteredAPICalls)),
                       percent(input > 0 ? Double(cached) / Double(input) : 0),
                       percent(output > 0 ? Double(reasoning) / Double(output) : 0)]
         for (label, value) in zip(summaryValues, values) { label.stringValue = value }
@@ -776,6 +794,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         case "input": value = compactNumber(stats.input)
         case "output": value = compactNumber(stats.output)
         case "reasoning": value = compactNumber(stats.reasoning)
+        case "rate": value = formatTokenRate(stats.tokenRate)
         case "typical": value = formatDuration(stats.typicalTTFT)
         case "slower": value = formatDuration(stats.slowerTTFT)
         case "duration": value = formatDuration(stats.averageDuration)
@@ -790,6 +809,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         case "output": cell.toolTip = fullNumber(stats.output) + " Token"
         case "reasoning": cell.toolTip = fullNumber(stats.reasoning) + " Token"
         case "value": cell.toolTip = pricingTooltip(model: stats.model, value: stats.valueUSD)
+        case "rate": cell.toolTip = "该模型已完成调用的输出 Token ÷ 出字阶段总耗时；缺少完整时序的调用不参与计算"
         default: cell.toolTip = nil
         }
         return cell
@@ -811,6 +831,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         case "api_fast": value = fastTierLabel(item.serviceTier)
         case "api_ttft": value = timingLabel(item.ttftMS, estimated: item.ttftEstimated)
         case "api_duration": value = timingLabel(item.durationMS, estimated: item.durationEstimated)
+        case "api_rate": value = formatTokenRate(item.tokenRate)
         case "api_input": value = usage.map { compactNumber($0.input) } ?? "--"
         case "api_cached": value = usage.map { compactNumber($0.cached) } ?? "--"
         case "api_output": value = usage.map { compactNumber($0.output) } ?? "--"
@@ -820,7 +841,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         default: value = ""
         }
         cell.textField?.stringValue = value
-        cell.textField?.alignment = ["api_ttft", "api_duration", "api_input", "api_cached", "api_output", "api_reasoning", "api_total", "api_value"].contains(id.rawValue) ? .right : .left
+        cell.textField?.alignment = ["api_ttft", "api_duration", "api_rate", "api_input", "api_cached", "api_output", "api_reasoning", "api_total", "api_value"].contains(id.rawValue) ? .right : .left
         cell.textField?.textColor = id.rawValue == "api_status" ? (item.status != nil ? .controlAccentColor : .secondaryLabelColor) : .labelColor
         if id.rawValue == "api_session" {
             cell.toolTip = item.sessionName
@@ -835,6 +856,10 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         } else if id.rawValue == "api_duration" {
             cell.toolTip = item.durationMS.map { "根据本地事件边界推算的模型调用总时长：\($0)ms" }
                 ?? "本次调用缺少可关联的结束时间"
+        } else if id.rawValue == "api_rate" {
+            cell.toolTip = item.tokenRate.map { _ in
+                "输出 Token ÷（总时长 − 首 Token），仅计算开始出字后的生成吞吐"
+            } ?? "缺少输出 Token、首 Token 或总时长，无法计算"
         } else if let usage, ["api_input", "api_cached", "api_output", "api_reasoning", "api_total"].contains(id.rawValue) {
             let exact: Int = id.rawValue == "api_input" ? usage.input : id.rawValue == "api_cached" ? usage.cached : id.rawValue == "api_output" ? usage.output : id.rawValue == "api_reasoning" ? usage.reasoning : usage.total
             cell.toolTip = fullNumber(exact) + " Token"
@@ -1064,6 +1089,37 @@ private func fastTierLabel(_ serviceTier: String?) -> String {
 private func timingLabel(_ milliseconds: Int?, estimated: Bool?) -> String {
     guard let milliseconds else { return "--" }
     return (estimated == true ? "≈ " : "") + formatDuration(milliseconds)
+}
+
+private func tokenRate(for call: APICallMetric) -> Double? {
+    guard call.usage.output > 0,
+          let ttftMS = call.ttftMS,
+          let durationMS = call.durationMS,
+          durationMS > ttftMS else { return nil }
+    return Double(call.usage.output) * 1_000 / Double(durationMS - ttftMS)
+}
+
+private func aggregateTokenRate(_ calls: [APICallMetric]) -> Double? {
+    var outputTokens = 0
+    var generationMS = 0
+    for call in calls {
+        guard call.usage.output > 0,
+              let ttftMS = call.ttftMS,
+              let durationMS = call.durationMS,
+              durationMS > ttftMS else { continue }
+        outputTokens += call.usage.output
+        generationMS += durationMS - ttftMS
+    }
+    guard outputTokens > 0, generationMS > 0 else { return nil }
+    return Double(outputTokens) * 1_000 / Double(generationMS)
+}
+
+private func formatTokenRate(_ value: Double?) -> String {
+    guard let value, value.isFinite, value >= 0 else { return "--" }
+    if value >= 1_000 { return String(format: "%.2fk tk/s", value / 1_000) }
+    if value >= 100 { return String(format: "%.0f tk/s", value) }
+    if value >= 10 { return String(format: "%.1f tk/s", value) }
+    return String(format: "%.2f tk/s", value)
 }
 
 private func elapsedMS(since timestamp: String) -> Int {
