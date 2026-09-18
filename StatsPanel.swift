@@ -37,6 +37,7 @@ private struct ConsoleRow {
     let ttftEstimated: Bool?
     let durationMS: Int?
     let durationEstimated: Bool?
+    let operation: String?
     let tokenRate: Double?
     let usage: TokenUsage?
 }
@@ -392,7 +393,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         consoleTable.usesAlternatingRowBackgroundColors = true
         consoleTable.rowHeight = 24
         addColumns([
-            ("api_status", "状态", 64), ("api_time", "时间", 124),
+            ("api_status", "状态", 64), ("api_operation", "类型", 56), ("api_time", "时间", 124),
             ("api_session", "会话", 124), ("api_model", "模型", 112),
             ("api_effort", "等级", 55), ("api_fast", "Fast", 48),
             ("api_ttft", "首 Token", 72), ("api_duration", "总时长", 72),
@@ -583,7 +584,9 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         chartView.points = dailyPoints(filteredRecords)
         tableView.reloadData()
         let modelCalls = filteredRecords.reduce(0) { $0 + ($1.modelCalls ?? 0) }
-        subtitleLabel.stringValue = "\(compactNumber(filteredRecords.count)) 个任务 · \(compactNumber(modelCalls)) 次 API 请求"
+        let compactions = filteredAPICalls.filter { $0.operation == "compaction" }.count
+        let compactionSuffix = compactions > 0 ? " · \(compactNumber(compactions)) 次压缩" : ""
+        subtitleLabel.stringValue = "\(compactNumber(filteredRecords.count)) 个任务 · \(compactNumber(modelCalls)) 次 API 请求\(compactionSuffix)"
     }
 
     private func rebuildConsole(animated: Bool = true) {
@@ -593,7 +596,9 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         let newRows = consoleRowsForCurrentPage()
         applyConsoleRows(newRows, animated: animated && consolePage == 0)
         let activeSuffix = activeAPICalls.isEmpty ? "" : " · \(activeAPICalls.count) 进行中"
-        consoleStatusLabel.stringValue = "\(fullNumber(apiCalls.count)) 次 API 请求\(activeSuffix)"
+        let compactions = apiCalls.filter { $0.operation == "compaction" }.count
+        let compactionSuffix = compactions > 0 ? " · \(fullNumber(compactions)) 次压缩" : ""
+        consoleStatusLabel.stringValue = "\(fullNumber(apiCalls.count)) 次 API 请求\(activeSuffix)\(compactionSuffix)"
         consolePageLabel.stringValue = "\(consolePage + 1) / \(pageCount)"
         previousPageButton.isEnabled = consolePage > 0
         nextPageButton.isEnabled = consolePage + 1 < pageCount
@@ -603,48 +608,36 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         let start = consolePage * consolePageSize
         let end = min(start + consolePageSize, apiCalls.count + activeAPICalls.count)
         guard start < end else { return [] }
-        var activeIndex = 0
-        var completedIndex = 0
-        var mergedIndex = 0
         var rows: [ConsoleRow] = []
         rows.reserveCapacity(end - start)
-        while mergedIndex < end {
-            let useActive: Bool
-            if activeIndex >= activeAPICalls.count {
-                useActive = false
-            } else if completedIndex >= apiCalls.count {
-                useActive = true
-            } else {
-                useActive = activeAPICalls[activeIndex].timestamp >= apiCalls[completedIndex].timestamp
+        let activeStart = min(start, activeAPICalls.count)
+        let activeEnd = min(end, activeAPICalls.count)
+        if activeStart < activeEnd {
+            for index in activeStart..<activeEnd {
+                let call = activeAPICalls[index]
+                rows.append(ConsoleRow(id: call.id, status: call.status,
+                                       sessionName: sessionTitles[call.sessionID] ?? call.sessionID,
+                                       timestamp: call.timestamp, model: call.model,
+                                       effort: call.effort, serviceTier: call.serviceTier,
+                                       ttftMS: call.ttftMS, ttftEstimated: call.ttftEstimated,
+                                       durationMS: call.durationMS, durationEstimated: call.durationEstimated,
+                                       operation: nil, tokenRate: nil, usage: nil))
             }
-            if useActive {
-                let call = activeAPICalls[activeIndex]
-                if mergedIndex >= start {
-                    rows.append(ConsoleRow(id: call.id, status: call.status,
-                                           sessionName: sessionTitles[call.sessionID] ?? call.sessionID,
-                                           timestamp: call.timestamp, model: call.model,
-                                           effort: call.effort, serviceTier: call.serviceTier,
-                                           ttftMS: call.ttftMS, ttftEstimated: call.ttftEstimated,
-                                           durationMS: call.durationMS, durationEstimated: call.durationEstimated,
-                                           tokenRate: nil,
-                                           usage: nil))
-                }
-                activeIndex += 1
-            } else {
-                let call = apiCalls[completedIndex]
-                if mergedIndex >= start {
-                    rows.append(ConsoleRow(id: call.id, status: nil,
-                                           sessionName: sessionTitles[call.sessionID] ?? call.sessionID,
-                                           timestamp: call.timestamp, model: call.model,
-                                           effort: call.effort, serviceTier: call.serviceTier,
-                                           ttftMS: call.ttftMS, ttftEstimated: call.ttftEstimated,
-                                           durationMS: call.durationMS, durationEstimated: call.durationEstimated,
-                                           tokenRate: tokenRate(for: call),
-                                           usage: call.usage))
-                }
-                completedIndex += 1
+        }
+        let completedStart = max(0, start - activeAPICalls.count)
+        let completedEnd = min(apiCalls.count, end - activeAPICalls.count)
+        if completedStart < completedEnd {
+            for index in completedStart..<completedEnd {
+                let call = apiCalls[index]
+                rows.append(ConsoleRow(id: call.id, status: nil,
+                                       sessionName: sessionTitles[call.sessionID] ?? call.sessionID,
+                                       timestamp: call.timestamp, model: call.model,
+                                       effort: call.effort, serviceTier: call.serviceTier,
+                                       ttftMS: call.ttftMS, ttftEstimated: call.ttftEstimated,
+                                       durationMS: call.durationMS, durationEstimated: call.durationEstimated,
+                                       operation: call.operation, tokenRate: tokenRate(for: call),
+                                       usage: call.usage))
             }
-            mergedIndex += 1
         }
         return rows
     }
@@ -821,50 +814,76 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         let id = column.identifier
         let cell = reusableCell(in: consoleTable, id: id)
         let usage = item.usage
+        let detailedUsage = usage.flatMap { usageHasBreakdown($0) ? $0 : nil }
         let value: String
         switch id.rawValue {
         case "api_status": value = item.status.map { "● \($0)" } ?? "已完成"
+        case "api_operation": value = item.operation == "compaction" ? "压缩" : "模型"
         case "api_time": value = clockLabel(item.timestamp)
         case "api_session": value = compactSessionTitle(item.sessionName)
         case "api_model": value = item.model
         case "api_effort": value = item.effort
         case "api_fast": value = fastTierLabel(item.serviceTier)
-        case "api_ttft": value = timingLabel(item.ttftMS, estimated: item.ttftEstimated)
+        case "api_ttft": value = item.operation == "compaction" ? "不适用" : timingLabel(item.ttftMS, estimated: item.ttftEstimated)
         case "api_duration": value = timingLabel(item.durationMS, estimated: item.durationEstimated)
-        case "api_rate": value = formatTokenRate(item.tokenRate)
-        case "api_input": value = usage.map { compactNumber($0.input) } ?? "--"
-        case "api_cached": value = usage.map { compactNumber($0.cached) } ?? "--"
-        case "api_output": value = usage.map { compactNumber($0.output) } ?? "--"
-        case "api_reasoning": value = usage.map { compactNumber($0.reasoning) } ?? "--"
+        case "api_rate": value = item.operation == "compaction" ? "不适用" : formatTokenRate(item.tokenRate)
+        case "api_input": value = detailedUsage.map { compactNumber($0.input) } ?? "--"
+        case "api_cached": value = detailedUsage.map { compactNumber($0.cached) } ?? "--"
+        case "api_output": value = detailedUsage.map { compactNumber($0.output) } ?? "--"
+        case "api_reasoning": value = detailedUsage.map { compactNumber($0.reasoning) } ?? "--"
         case "api_total": value = usage.map { compactNumber($0.total) } ?? "--"
         case "api_value": value = usage.map { formatUSD(estimatedAPICost(model: item.model, usage: $0)) } ?? "--"
         default: value = ""
         }
         cell.textField?.stringValue = value
         cell.textField?.alignment = ["api_ttft", "api_duration", "api_rate", "api_input", "api_cached", "api_output", "api_reasoning", "api_total", "api_value"].contains(id.rawValue) ? .right : .left
-        cell.textField?.textColor = id.rawValue == "api_status" ? (item.status != nil ? .controlAccentColor : .secondaryLabelColor) : .labelColor
+        if id.rawValue == "api_status" {
+            cell.textField?.textColor = item.status != nil ? .controlAccentColor : .secondaryLabelColor
+        } else if id.rawValue == "api_operation", item.operation == "compaction" {
+            cell.textField?.textColor = .systemOrange
+        } else {
+            cell.textField?.textColor = .labelColor
+        }
         if id.rawValue == "api_session" {
             cell.toolTip = item.sessionName
+        } else if id.rawValue == "api_operation" {
+            cell.toolTip = item.operation == "compaction"
+                ? "Codex 上下文压缩调用；具备完整用量时会计入 Token 和等价花费"
+                : "普通模型调用"
         } else if id.rawValue == "api_time" {
             cell.toolTip = item.timestamp
         } else if id.rawValue == "api_fast" {
             cell.toolTip = item.serviceTier.map { "Codex service tier：\($0)" } ?? "旧记录未包含 service tier"
         } else if id.rawValue == "api_ttft" {
-            cell.toolTip = item.ttftMS.map {
-                item.ttftEstimated == true ? "根据本地事件边界推算的首响应：\($0)ms" : "Codex 记录的首 Token：\($0)ms"
-            } ?? "本次调用缺少可关联的首响应时间"
+            if item.operation == "compaction" {
+                cell.toolTip = "上下文压缩没有可观测的首 Token，因而不适用"
+            } else {
+                cell.toolTip = item.ttftMS.map {
+                    item.ttftEstimated == true ? "根据本地事件边界推算的首响应：\($0)ms" : "Codex 记录的首 Token：\($0)ms"
+                } ?? "本次调用缺少可关联的首响应时间"
+            }
         } else if id.rawValue == "api_duration" {
             cell.toolTip = item.durationMS.map { "根据本地事件边界推算的模型调用总时长：\($0)ms" }
                 ?? "本次调用缺少可关联的结束时间"
         } else if id.rawValue == "api_rate" {
-            cell.toolTip = item.tokenRate.map { _ in
-                "输出 Token ÷（总时长 − 首 Token），仅计算开始出字后的生成吞吐"
-            } ?? "缺少输出 Token、首 Token 或总时长，无法计算"
+            if item.operation == "compaction" {
+                cell.toolTip = "上下文压缩没有可观测的流式生成区间，Token 速率不适用"
+            } else {
+                cell.toolTip = item.tokenRate.map { _ in
+                    "输出 Token ÷（总时长 − 首 Token），仅计算开始出字后的生成吞吐"
+                } ?? "缺少输出 Token、首 Token 或总时长，无法计算"
+            }
         } else if let usage, ["api_input", "api_cached", "api_output", "api_reasoning", "api_total"].contains(id.rawValue) {
+            if id.rawValue != "api_total" && !usageHasBreakdown(usage) {
+                cell.toolTip = "旧版 Codex 记录只提供总 Token，无法可靠拆分输入、缓存、输出与推理"
+                return cell
+            }
             let exact: Int = id.rawValue == "api_input" ? usage.input : id.rawValue == "api_cached" ? usage.cached : id.rawValue == "api_output" ? usage.output : id.rawValue == "api_reasoning" ? usage.reasoning : usage.total
             cell.toolTip = fullNumber(exact) + " Token"
         } else if id.rawValue == "api_value", let usage {
-            cell.toolTip = pricingTooltip(model: item.model, value: estimatedAPICost(model: item.model, usage: usage))
+            cell.toolTip = usageHasBreakdown(usage)
+                ? pricingTooltip(model: item.model, value: estimatedAPICost(model: item.model, usage: usage))
+                : "旧版记录缺少输入/缓存/输出拆分，无法可靠估算等价花费"
         } else { cell.toolTip = nil }
         return cell
     }
@@ -1193,12 +1212,16 @@ private func apiPrice(for rawModel: String) -> APIPrice? {
 
 private func estimatedAPICost(model: String, usage: TokenUsage) -> Double? {
     guard let price = apiPrice(for: model) else { return nil }
-    guard usage.total == 0 || usage.input > 0 || usage.output > 0 else { return nil }
+    guard usageHasBreakdown(usage) else { return nil }
     let cachedTokens = min(max(usage.cached, 0), max(usage.input, 0))
     let uncachedTokens = max(usage.input - cachedTokens, 0)
     return (Double(uncachedTokens) * price.input
             + Double(cachedTokens) * price.cached
             + Double(max(usage.output, 0)) * price.output) / 1_000_000
+}
+
+private func usageHasBreakdown(_ usage: TokenUsage) -> Bool {
+    usage.total == 0 || usage.input > 0 || usage.output > 0
 }
 
 func summedAPICost(_ records: [RequestMetric]) -> Double? {

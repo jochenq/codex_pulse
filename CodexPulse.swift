@@ -44,6 +44,7 @@ struct APICallMetric: Codable {
     var ttftEstimated: Bool?
     let durationMS: Int?
     let durationEstimated: Bool?
+    let operation: String?
     let usage: TokenUsage
     let source: String
 }
@@ -71,6 +72,8 @@ private struct PendingTurn {
     var effort = "未知"
     var usage = TokenUsage()
     var baselineUsage = TokenUsage()
+    var apiUsage = TokenUsage()
+    var apiUsageComplete = true
     var modelCalls = 0
 }
 
@@ -80,6 +83,11 @@ private struct PendingAPIState {
     var lastResponseTimestamp: String?
     var serviceTier: String?
     var status: String
+}
+
+private struct PendingUsageRecord {
+    let timestamp: String
+    let usage: TokenUsage
 }
 
 private struct ParseResult {
@@ -106,6 +114,7 @@ final class MetricStore {
     private let apiCallMigrationKey = "api-call-records-v1"
     private let apiCallDetailsMigrationKey = "api-call-details-v2"
     private let apiCallItemTimingMigrationKey = "api-call-item-timing-v3"
+    private let apiCallUsageRecordMigrationKey = "api-call-usage-record-v4"
 
     var liveRequests: [LiveRequest] {
         let cutoff = Date().addingTimeInterval(-6 * 60 * 60)
@@ -219,7 +228,8 @@ final class MetricStore {
             || !UserDefaults.standard.bool(forKey: modelCallMigrationKey)
             || !UserDefaults.standard.bool(forKey: apiCallMigrationKey)
             || !UserDefaults.standard.bool(forKey: apiCallDetailsMigrationKey)
-            || !UserDefaults.standard.bool(forKey: apiCallItemTimingMigrationKey) {
+            || !UserDefaults.standard.bool(forKey: apiCallItemTimingMigrationKey)
+            || !UserDefaults.standard.bool(forKey: apiCallUsageRecordMigrationKey) {
             return rebuildAllHistoryWithTurnDeltas()
         }
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -311,6 +321,7 @@ final class MetricStore {
         UserDefaults.standard.set(true, forKey: apiCallMigrationKey)
         UserDefaults.standard.set(true, forKey: apiCallDetailsMigrationKey)
         UserDefaults.standard.set(true, forKey: apiCallItemTimingMigrationKey)
+        UserDefaults.standard.set(true, forKey: apiCallUsageRecordMigrationKey)
         return records.count
     }
 
@@ -321,6 +332,8 @@ final class MetricStore {
         var pending: PendingTurn?
         var pendingAPIState: PendingAPIState?
         var completedAPIStateAwaitingUsage: PendingAPIState?
+        var pendingUsageRecord: PendingUsageRecord?
+        var pendingOperation: String?
         var result: [RequestMetric] = []
         var apiCallResult: [APICallMetric] = []
         var sessionID = file.deletingPathExtension().lastPathComponent.split(separator: "-").last.map(String.init) ?? file.lastPathComponent
@@ -343,6 +356,23 @@ final class MetricStore {
                 continue
             }
 
+            if type == "token_usage_record",
+               let rawUsage = payload["usage"] as? [String: Any] {
+                pendingUsageRecord = PendingUsageRecord(
+                    timestamp: timestamp,
+                    usage: tokenUsage(rawUsage)
+                )
+                continue
+            }
+
+            if type == "compacted", pending != nil {
+                pendingOperation = "compaction"
+                let responseTimestamp = pendingUsageRecord?.timestamp ?? timestamp
+                markAPIResponse(&pendingAPIState, firstTimestamp: responseTimestamp,
+                                lastTimestamp: responseTimestamp, status: "压缩中")
+                continue
+            }
+
             if type == "event_msg", let eventType = payload["type"] as? String {
                 switch eventType {
                 case "task_started":
@@ -352,6 +382,8 @@ final class MetricStore {
                         turn.effort = lastEffort ?? turn.effort
                         turn.baselineUsage = sessionUsage
                         pending = turn
+                        pendingUsageRecord = nil
+                        pendingOperation = nil
                         pendingAPIState = PendingAPIState(startTimestamp: timestamp,
                                                          firstResponseTimestamp: nil,
                                                          lastResponseTimestamp: nil,
@@ -374,6 +406,19 @@ final class MetricStore {
                     if let lastUsage = info["last_token_usage"] as? [String: Any],
                        int(lastUsage["total_tokens"]) > 0 {
                         turn.modelCalls += 1
+                        let legacyUsage = tokenUsage(lastUsage)
+                        let authoritativeUsage = pendingUsageRecord.flatMap { record -> TokenUsage? in
+                            guard record.usage.total > 0,
+                                  let elapsed = apiElapsedMS(from: record.timestamp, to: timestamp),
+                                  elapsed <= 5_000 else { return nil }
+                            return record.usage
+                        }
+                        let resolvedUsage = authoritativeUsage ?? legacyUsage
+                        turn.apiUsage = addingUsage(turn.apiUsage, resolvedUsage)
+                        if resolvedUsage.total > 0 && resolvedUsage.input == 0 && resolvedUsage.output == 0 {
+                            turn.apiUsageComplete = false
+                        }
+                        if turn.apiUsageComplete { turn.usage = turn.apiUsage }
                         let timing = completedAPIStateAwaitingUsage ?? pendingAPIState
                         let inferredTTFT = apiElapsedMS(from: timing?.startTimestamp,
                                                        to: timing?.firstResponseTimestamp)
@@ -387,15 +432,12 @@ final class MetricStore {
                             ttftEstimated: inferredTTFT == nil ? nil : true,
                             durationMS: inferredDuration,
                             durationEstimated: inferredDuration == nil ? nil : true,
-                            usage: TokenUsage(
-                                input: int(lastUsage["input_tokens"]),
-                                cached: int(lastUsage["cached_input_tokens"]),
-                                output: int(lastUsage["output_tokens"]),
-                                reasoning: int(lastUsage["reasoning_output_tokens"]),
-                                total: int(lastUsage["total_tokens"])
-                            ),
+                            operation: pendingOperation,
+                            usage: resolvedUsage,
                             source: file.path
                         ))
+                        pendingUsageRecord = nil
+                        pendingOperation = nil
                         if completedAPIStateAwaitingUsage != nil {
                             completedAPIStateAwaitingUsage = nil
                         } else {
@@ -430,6 +472,8 @@ final class MetricStore {
                     pending = nil
                     pendingAPIState = nil
                     completedAPIStateAwaitingUsage = nil
+                    pendingUsageRecord = nil
+                    pendingOperation = nil
                 case "item_completed":
                     guard let item = payload["item"] as? [String: Any],
                           let itemType = item["type"] as? String,
@@ -1189,6 +1233,26 @@ private func int(_ value: Any?) -> Int {
     if let value = value as? NSNumber { return value.intValue }
     if let value = value as? String { return Int(value) ?? 0 }
     return 0
+}
+
+private func tokenUsage(_ raw: [String: Any]) -> TokenUsage {
+    TokenUsage(
+        input: int(raw["input_tokens"]),
+        cached: int(raw["cached_input_tokens"]),
+        output: int(raw["output_tokens"]),
+        reasoning: int(raw["reasoning_output_tokens"]),
+        total: int(raw["total_tokens"])
+    )
+}
+
+private func addingUsage(_ lhs: TokenUsage, _ rhs: TokenUsage) -> TokenUsage {
+    TokenUsage(
+        input: lhs.input + rhs.input,
+        cached: lhs.cached + rhs.cached,
+        output: lhs.output + rhs.output,
+        reasoning: lhs.reasoning + rhs.reasoning,
+        total: lhs.total + rhs.total
+    )
 }
 
 private func usageDelta(_ current: TokenUsage, since baseline: TokenUsage) -> TokenUsage {
