@@ -38,6 +38,7 @@ struct APICallMetric: Codable {
     let turnID: String
     let timestamp: String
     let model: String
+    let responseModel: String?
     let effort: String
     let serviceTier: String?
     var ttftMS: Int?
@@ -55,6 +56,7 @@ struct ActiveAPICall {
     let turnID: String
     let timestamp: String
     let model: String
+    let responseModel: String?
     let effort: String
     let serviceTier: String?
     let ttftMS: Int?
@@ -82,12 +84,14 @@ private struct PendingAPIState {
     var firstResponseTimestamp: String?
     var lastResponseTimestamp: String?
     var serviceTier: String?
+    var responseModel: String?
     var status: String
 }
 
 private struct PendingUsageRecord {
     let timestamp: String
     let usage: TokenUsage
+    let responseModel: String?
 }
 
 private struct ParseResult {
@@ -115,6 +119,7 @@ final class MetricStore {
     private let apiCallDetailsMigrationKey = "api-call-details-v2"
     private let apiCallItemTimingMigrationKey = "api-call-item-timing-v3"
     private let apiCallUsageRecordMigrationKey = "api-call-usage-record-v4"
+    private let apiCallResponseModelMigrationKey = "api-call-response-model-v5"
 
     var liveRequests: [LiveRequest] {
         let cutoff = Date().addingTimeInterval(-6 * 60 * 60)
@@ -132,10 +137,16 @@ final class MetricStore {
         let withFractions = ISO8601DateFormatter()
         withFractions.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let plain = ISO8601DateFormatter()
-        return activeAPIBySource.values.filter {
+        let recent = activeAPIBySource.values.filter {
             guard let date = withFractions.date(from: $0.timestamp) ?? plain.date(from: $0.timestamp) else { return false }
             return date >= cutoff
-        }.sorted { $0.timestamp > $1.timestamp }
+        }
+        var uniqueByID: [String: ActiveAPICall] = [:]
+        for call in recent {
+            if let existing = uniqueByID[call.id], existing.timestamp >= call.timestamp { continue }
+            uniqueByID[call.id] = call
+        }
+        return uniqueByID.values.sorted { $0.timestamp > $1.timestamp }
     }
 
     let directoryURL: URL
@@ -229,7 +240,8 @@ final class MetricStore {
             || !UserDefaults.standard.bool(forKey: apiCallMigrationKey)
             || !UserDefaults.standard.bool(forKey: apiCallDetailsMigrationKey)
             || !UserDefaults.standard.bool(forKey: apiCallItemTimingMigrationKey)
-            || !UserDefaults.standard.bool(forKey: apiCallUsageRecordMigrationKey) {
+            || !UserDefaults.standard.bool(forKey: apiCallUsageRecordMigrationKey)
+            || !UserDefaults.standard.bool(forKey: apiCallResponseModelMigrationKey) {
             return rebuildAllHistoryWithTurnDeltas()
         }
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -322,6 +334,7 @@ final class MetricStore {
         UserDefaults.standard.set(true, forKey: apiCallDetailsMigrationKey)
         UserDefaults.standard.set(true, forKey: apiCallItemTimingMigrationKey)
         UserDefaults.standard.set(true, forKey: apiCallUsageRecordMigrationKey)
+        UserDefaults.standard.set(true, forKey: apiCallResponseModelMigrationKey)
         return records.count
     }
 
@@ -351,6 +364,12 @@ final class MetricStore {
             if !timestamp.isEmpty { latestTimestamp = timestamp }
             guard let payload = object["payload"] as? [String: Any] else { continue }
 
+            let observedResponseModel = reportedResponseModel(eventType: type, payload: payload)
+            if let observedResponseModel, var apiState = pendingAPIState {
+                apiState.responseModel = observedResponseModel
+                pendingAPIState = apiState
+            }
+
             if type == "session_meta" {
                 sessionID = payload["id"] as? String ?? payload["session_id"] as? String ?? sessionID
                 continue
@@ -360,7 +379,8 @@ final class MetricStore {
                let rawUsage = payload["usage"] as? [String: Any] {
                 pendingUsageRecord = PendingUsageRecord(
                     timestamp: timestamp,
-                    usage: tokenUsage(rawUsage)
+                    usage: tokenUsage(rawUsage),
+                    responseModel: observedResponseModel ?? pendingAPIState?.responseModel
                 )
                 continue
             }
@@ -388,6 +408,7 @@ final class MetricStore {
                                                          firstResponseTimestamp: nil,
                                                          lastResponseTimestamp: nil,
                                                          serviceTier: lastServiceTier,
+                                                         responseModel: nil,
                                                          status: "请求中")
                     }
                 case "token_count":
@@ -426,7 +447,9 @@ final class MetricStore {
                                                            to: timing?.lastResponseTimestamp)
                         apiCallResult.append(APICallMetric(
                             id: "\(sessionID):\(timestamp)", sessionID: sessionID, turnID: turn.id,
-                            timestamp: timestamp, model: turn.model, effort: turn.effort,
+                            timestamp: timestamp, model: turn.model,
+                            responseModel: pendingUsageRecord?.responseModel ?? timing?.responseModel,
+                            effort: turn.effort,
                             serviceTier: timing?.serviceTier,
                             ttftMS: inferredTTFT,
                             ttftEstimated: inferredTTFT == nil ? nil : true,
@@ -445,6 +468,7 @@ final class MetricStore {
                                                              firstResponseTimestamp: nil,
                                                              lastResponseTimestamp: nil,
                                                              serviceTier: lastServiceTier,
+                                                             responseModel: nil,
                                                              status: "请求中")
                         }
                     }
@@ -522,6 +546,7 @@ final class MetricStore {
                                                      firstResponseTimestamp: nil,
                                                      lastResponseTimestamp: nil,
                                                      serviceTier: lastServiceTier,
+                                                     responseModel: nil,
                                                      status: "请求中")
                 case "reasoning":
                     markAPIResponse(&pendingAPIState, firstTimestamp: timestamp,
@@ -550,6 +575,7 @@ final class MetricStore {
                 let endTimestamp = $0.lastResponseTimestamp ?? latestTimestamp
                 return ActiveAPICall(id: "active:\(sessionID):\(turn.id):\($0.startTimestamp)", sessionID: sessionID,
                                      turnID: turn.id, timestamp: $0.startTimestamp, model: turn.model,
+                                     responseModel: $0.responseModel,
                                      effort: turn.effort, serviceTier: $0.serviceTier,
                                      ttftMS: apiElapsedMS(from: $0.startTimestamp, to: $0.firstResponseTimestamp),
                                      ttftEstimated: $0.firstResponseTimestamp == nil ? nil : true,
@@ -623,6 +649,28 @@ final class MetricStore {
             try? handle.write(contentsOf: data + Data([0x0a]))
         }
     }
+}
+
+private func reportedResponseModel(eventType: String, payload: [String: Any]) -> String? {
+    func validModel(_ value: Any?) -> String? {
+        guard let model = value as? String else { return nil }
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    for key in ["response_model", "upstream_model", "actual_model"] {
+        if let model = validModel(payload[key]) { return model }
+    }
+    if let response = payload["response"] as? [String: Any],
+       let model = validModel(response["model"]) {
+        return model
+    }
+
+    let payloadType = (payload["type"] as? String) ?? ""
+    let responseEvent = eventType.lowercased().contains("response")
+        || payloadType.lowercased().contains("response")
+        || eventType == "token_usage_record"
+    return responseEvent ? validModel(payload["model"]) : nil
 }
 
 private func markAPIResponse(_ state: inout PendingAPIState?, firstTimestamp: String,

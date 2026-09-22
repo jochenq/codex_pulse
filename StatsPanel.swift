@@ -31,6 +31,7 @@ private struct ConsoleRow {
     let sessionName: String
     let timestamp: String
     let model: String
+    let responseModel: String?
     let effort: String
     let serviceTier: String?
     let ttftMS: Int?
@@ -40,6 +41,11 @@ private struct ConsoleRow {
     let operation: String?
     let tokenRate: Double?
     let usage: TokenUsage?
+
+    var hasModelMismatch: Bool {
+        guard let responseModel else { return false }
+        return normalizedModelName(model) != normalizedModelName(responseModel)
+    }
 }
 
 private enum MetricCardStyle {
@@ -391,10 +397,10 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         consoleTable.delegate = self
         consoleTable.dataSource = self
         consoleTable.usesAlternatingRowBackgroundColors = true
-        consoleTable.rowHeight = 24
+        consoleTable.rowHeight = 32
         addColumns([
             ("api_status", "状态", 64), ("api_operation", "类型", 56), ("api_time", "时间", 124),
-            ("api_session", "会话", 124), ("api_model", "模型", 112),
+            ("api_session", "会话", 140), ("api_model", "模型", 230),
             ("api_effort", "等级", 55), ("api_fast", "Fast", 48),
             ("api_ttft", "首 Token", 72), ("api_duration", "总时长", 72),
             ("api_rate", "Token 速率", 86),
@@ -618,6 +624,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
                 rows.append(ConsoleRow(id: call.id, status: call.status,
                                        sessionName: sessionTitles[call.sessionID] ?? call.sessionID,
                                        timestamp: call.timestamp, model: call.model,
+                                       responseModel: call.responseModel,
                                        effort: call.effort, serviceTier: call.serviceTier,
                                        ttftMS: call.ttftMS, ttftEstimated: call.ttftEstimated,
                                        durationMS: call.durationMS, durationEstimated: call.durationEstimated,
@@ -632,6 +639,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
                 rows.append(ConsoleRow(id: call.id, status: nil,
                                        sessionName: sessionTitles[call.sessionID] ?? call.sessionID,
                                        timestamp: call.timestamp, model: call.model,
+                                       responseModel: call.responseModel,
                                        effort: call.effort, serviceTier: call.serviceTier,
                                        ttftMS: call.ttftMS, ttftEstimated: call.ttftEstimated,
                                        durationMS: call.durationMS, durationEstimated: call.durationEstimated,
@@ -653,17 +661,22 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         let newIDs = newRows.map(\.id)
         let oldSet = Set(oldIDs)
         let newSet = Set(newIDs)
-        guard oldIDs.filter(newSet.contains) == newIDs.filter(oldSet.contains) else {
+        guard oldSet.count == oldIDs.count,
+              newSet.count == newIDs.count,
+              oldIDs.filter(newSet.contains) == newIDs.filter(oldSet.contains) else {
             consoleRows = newRows
             consoleTable.reloadData()
             return
         }
         let removals = IndexSet(oldIDs.indices.filter { !newSet.contains(oldIDs[$0]) })
         let insertions = IndexSet(newIDs.indices.filter { !oldSet.contains(newIDs[$0]) })
-        let oldByID = Dictionary(uniqueKeysWithValues: oldRows.map { ($0.id, $0) })
-        let statusChanges = IndexSet(newRows.indices.filter {
+        var oldByID: [String: ConsoleRow] = [:]
+        for row in oldRows { oldByID[row.id] = row }
+        let contentChanges = IndexSet(newRows.indices.filter {
             guard let old = oldByID[newRows[$0].id] else { return false }
             return old.status != newRows[$0].status
+                || old.model != newRows[$0].model
+                || old.responseModel != newRows[$0].responseModel
         })
         consoleRows = newRows
         if !removals.isEmpty || !insertions.isEmpty {
@@ -672,8 +685,9 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
             consoleTable.insertRows(at: insertions, withAnimation: [.slideDown, .effectFade])
             consoleTable.endUpdates()
         }
-        if !statusChanges.isEmpty {
-            consoleTable.reloadData(forRowIndexes: statusChanges,
+        if !contentChanges.isEmpty {
+            consoleTable.noteHeightOfRows(withIndexesChanged: contentChanges)
+            consoleTable.reloadData(forRowIndexes: contentChanges,
                                     columnIndexes: IndexSet(integersIn: 0..<consoleTable.numberOfColumns))
         }
     }
@@ -773,6 +787,11 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         return statsCell(column: tableColumn, row: row)
     }
 
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        guard tableView === consoleTable, row < consoleRows.count else { return tableView.rowHeight }
+        return consoleRows[row].hasModelMismatch ? 50 : 32
+    }
+
     private func statsCell(column: NSTableColumn, row: Int) -> NSView? {
         guard row < groupRows.count else { return nil }
         let stats = groupRows[row]
@@ -812,16 +831,19 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         guard row < consoleRows.count else { return nil }
         let item = consoleRows[row]
         let id = column.identifier
+        if id.rawValue == "api_model" {
+            return consoleModelCell(item: item, identifier: id)
+        }
         let cell = reusableCell(in: consoleTable, id: id)
         let usage = item.usage
         let detailedUsage = usage.flatMap { usageHasBreakdown($0) ? $0 : nil }
+        let pricedModel = item.responseModel ?? item.model
         let value: String
         switch id.rawValue {
         case "api_status": value = item.status.map { "● \($0)" } ?? "已完成"
         case "api_operation": value = item.operation == "compaction" ? "压缩" : "模型"
         case "api_time": value = clockLabel(item.timestamp)
         case "api_session": value = compactSessionTitle(item.sessionName)
-        case "api_model": value = item.model
         case "api_effort": value = item.effort
         case "api_fast": value = fastTierLabel(item.serviceTier)
         case "api_ttft": value = item.operation == "compaction" ? "不适用" : timingLabel(item.ttftMS, estimated: item.ttftEstimated)
@@ -832,7 +854,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         case "api_output": value = detailedUsage.map { compactNumber($0.output) } ?? "--"
         case "api_reasoning": value = detailedUsage.map { compactNumber($0.reasoning) } ?? "--"
         case "api_total": value = usage.map { compactNumber($0.total) } ?? "--"
-        case "api_value": value = usage.map { formatUSD(estimatedAPICost(model: item.model, usage: $0)) } ?? "--"
+        case "api_value": value = usage.map { formatUSD(estimatedAPICost(model: pricedModel, usage: $0)) } ?? "--"
         default: value = ""
         }
         cell.textField?.stringValue = value
@@ -882,9 +904,18 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
             cell.toolTip = fullNumber(exact) + " Token"
         } else if id.rawValue == "api_value", let usage {
             cell.toolTip = usageHasBreakdown(usage)
-                ? pricingTooltip(model: item.model, value: estimatedAPICost(model: item.model, usage: usage))
+                ? pricingTooltip(model: pricedModel, value: estimatedAPICost(model: pricedModel, usage: usage))
                 : "旧版记录缺少输入/缓存/输出拆分，无法可靠估算等价花费"
         } else { cell.toolTip = nil }
+        return cell
+    }
+
+    private func consoleModelCell(item: ConsoleRow,
+                                  identifier: NSUserInterfaceItemIdentifier) -> NSView {
+        let cell = (consoleTable.makeView(withIdentifier: identifier, owner: self) as? ConsoleModelCellView)
+            ?? ConsoleModelCellView()
+        cell.identifier = identifier
+        cell.configure(requestedModel: item.model, responseModel: item.responseModel)
         return cell
     }
 
@@ -906,6 +937,90 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         }
         return cell
     }
+}
+
+private final class ConsoleModelCellView: NSTableCellView {
+    private let requestedLabel = NSTextField(labelWithString: "")
+    private let responseLabel = NSTextField(labelWithString: "")
+    private let mismatchBadge = MismatchBadgeView()
+    private let responseRow: NSStackView
+    private let contentStack: NSStackView
+
+    override init(frame frameRect: NSRect) {
+        responseRow = NSStackView(views: [responseLabel, mismatchBadge])
+        contentStack = NSStackView(views: [requestedLabel, responseRow])
+        super.init(frame: frameRect)
+
+        requestedLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        requestedLabel.textColor = .labelColor
+        requestedLabel.lineBreakMode = .byTruncatingTail
+        requestedLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        responseLabel.font = .monospacedDigitSystemFont(ofSize: 10, weight: .regular)
+        responseLabel.textColor = .systemOrange
+        responseLabel.lineBreakMode = .byTruncatingTail
+        responseLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        responseRow.orientation = .horizontal
+        responseRow.alignment = .centerY
+        responseRow.spacing = 6
+        responseRow.setHuggingPriority(.defaultLow, for: .horizontal)
+
+        contentStack.orientation = .vertical
+        contentStack.alignment = .leading
+        contentStack.spacing = 2
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(contentStack)
+        NSLayoutConstraint.activate([
+            contentStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+            contentStack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -4),
+            contentStack.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func configure(requestedModel: String, responseModel: String?) {
+        requestedLabel.stringValue = requestedModel
+        guard let responseModel,
+              normalizedModelName(requestedModel) != normalizedModelName(responseModel) else {
+            responseRow.isHidden = true
+            toolTip = responseModel == nil
+                ? "本地事件未包含上游响应模型；当前显示请求配置模型"
+                : "请求模型与上游响应模型一致：\(requestedModel)"
+            return
+        }
+        responseLabel.stringValue = "↳ 上游响应：\(responseModel)"
+        responseRow.isHidden = false
+        toolTip = "请求模型：\(requestedModel)\n上游响应模型：\(responseModel)"
+    }
+}
+
+private final class MismatchBadgeView: NSView {
+    private let label = NSTextField(labelWithString: "模型不一致")
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.cornerRadius = 4
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.systemOrange.withAlphaComponent(0.8).cgColor
+        layer?.backgroundColor = NSColor.systemOrange.withAlphaComponent(0.10).cgColor
+        label.font = .systemFont(ofSize: 9, weight: .semibold)
+        label.textColor = .systemOrange
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 5),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -5),
+            label.topAnchor.constraint(equalTo: topAnchor, constant: 1),
+            label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -1)
+        ])
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+    }
+
+    required init?(coder: NSCoder) { nil }
 }
 
 private final class DailyTokenChartView: NSView {
@@ -1144,6 +1259,10 @@ private func formatTokenRate(_ value: Double?) -> String {
 private func elapsedMS(since timestamp: String) -> Int {
     guard let start = metricDate(timestamp) else { return 0 }
     return max(0, Int(Date().timeIntervalSince(start) * 1_000))
+}
+
+private func normalizedModelName(_ value: String) -> String {
+    value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
 }
 
 private func percent(_ value: Double) -> String { String(format: "%.1f%%", value * 100) }
