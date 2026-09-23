@@ -101,6 +101,21 @@ private struct ParseResult {
     var activeAPI: ActiveAPICall?
 }
 
+private struct ParseCheckpoint {
+    var offset: UInt64
+    var pending: PendingTurn?
+    var pendingAPIState: PendingAPIState?
+    var completedAPIStateAwaitingUsage: PendingAPIState?
+    var pendingUsageRecord: PendingUsageRecord?
+    var pendingOperation: String?
+    var sessionID: String
+    var lastModel: String?
+    var lastEffort: String?
+    var lastServiceTier: String?
+    var sessionUsage: TokenUsage
+    var latestTimestamp: String
+}
+
 final class MetricStore {
     private(set) var records: [RequestMetric] = []
     private(set) var apiCalls: [APICallMetric] = []
@@ -109,6 +124,7 @@ final class MetricStore {
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
     private var scannedModificationDates: [String: Date] = [:]
+    private var parseCheckpointsBySource: [String: ParseCheckpoint] = [:]
     private var liveBySource: [String: LiveRequest] = [:]
     private var activeAPIBySource: [String: ActiveAPICall] = [:]
     private var cachedSessionTitles: [String: String] = [:]
@@ -137,8 +153,12 @@ final class MetricStore {
         let withFractions = ISO8601DateFormatter()
         withFractions.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let plain = ISO8601DateFormatter()
+        let idleCutoff = Date().addingTimeInterval(-5 * 60)
         let recent = activeAPIBySource.values.filter {
             guard let date = withFractions.date(from: $0.timestamp) ?? plain.date(from: $0.timestamp) else { return false }
+            guard let lastModified = scannedModificationDates[$0.source],
+                  lastModified >= idleCutoff,
+                  FileManager.default.fileExists(atPath: $0.source) else { return false }
             return date >= cutoff
         }
         var uniqueByID: [String: ActiveAPICall] = [:]
@@ -154,9 +174,9 @@ final class MetricStore {
     let apiCallsURL: URL
     private let scanStateURL: URL
 
-    init() {
+    init(directoryURL customDirectoryURL: URL? = nil) {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        directoryURL = base.appendingPathComponent("Codex Pulse", isDirectory: true)
+        directoryURL = customDirectoryURL ?? base.appendingPathComponent("Codex Pulse", isDirectory: true)
         recordsURL = directoryURL.appendingPathComponent("requests.jsonl")
         apiCallsURL = directoryURL.appendingPathComponent("api-calls.jsonl")
         scanStateURL = directoryURL.appendingPathComponent("scan-state.json")
@@ -250,6 +270,7 @@ final class MetricStore {
             home.appendingPathComponent(".codex/archived_sessions", isDirectory: true)
         ]
         var files: [URL] = []
+        var visiblePaths = Set<String>()
         for root in roots {
             guard let enumerator = FileManager.default.enumerator(
                 at: root,
@@ -257,6 +278,7 @@ final class MetricStore {
                 options: [.skipsHiddenFiles]
             ) else { continue }
             for case let file as URL in enumerator where file.pathExtension == "jsonl" {
+                visiblePaths.insert(file.path)
                 let values = try? file.resourceValues(forKeys: [.contentModificationDateKey])
                 let modified = values?.contentModificationDate ?? .distantPast
                 if scannedModificationDates[file.path] != modified {
@@ -266,6 +288,24 @@ final class MetricStore {
             }
         }
 
+        // A missing, archived, or idle source has no trustworthy live state.
+        // Drop its cached row instead of leaving a ghost request at the top.
+        let idleCutoff = Date().addingTimeInterval(-5 * 60)
+        let livePaths = Set(activeAPIBySource.keys).union(liveBySource.keys)
+        for path in livePaths
+            where !visiblePaths.contains(path)
+                || !path.contains("/.codex/sessions/")
+                || (scannedModificationDates[path] ?? .distantPast) < idleCutoff {
+            activeAPIBySource.removeValue(forKey: path)
+            liveBySource.removeValue(forKey: path)
+        }
+        var removedPaths = false
+        for path in Array(scannedModificationDates.keys) where !visiblePaths.contains(path) {
+            scannedModificationDates.removeValue(forKey: path)
+            parseCheckpointsBySource.removeValue(forKey: path)
+            removedPaths = true
+        }
+
         var imported: [RequestMetric] = []
         var importedAPICalls: [APICallMetric] = []
         for file in files {
@@ -273,19 +313,20 @@ final class MetricStore {
                 let parsed = parse(file: file)
                 imported.append(contentsOf: parsed.completed)
                 importedAPICalls.append(contentsOf: parsed.apiCalls)
-                liveBySource[file.path] = parsed.pending
-                activeAPIBySource[file.path] = parsed.activeAPI
+                let isCurrentSession = file.path.contains("/.codex/sessions/")
+                liveBySource[file.path] = isCurrentSession ? parsed.pending : nil
+                activeAPIBySource[file.path] = isCurrentSession ? parsed.activeAPI : nil
             }
         }
         imported = imported.filter { !knownIDs.contains($0.turnID) }
         imported.sort { $0.timestamp < $1.timestamp }
         for metric in imported { append(metric) }
-        records.sort { $0.timestamp > $1.timestamp }
+        if !imported.isEmpty { records.sort { $0.timestamp > $1.timestamp } }
         importedAPICalls = importedAPICalls.filter { !knownAPICallIDs.contains($0.id) }
         importedAPICalls.sort { $0.timestamp < $1.timestamp }
         for metric in importedAPICalls { appendAPICall(metric) }
-        apiCalls.sort { $0.timestamp > $1.timestamp }
-        saveScanState()
+        if !importedAPICalls.isEmpty { apiCalls.sort { $0.timestamp > $1.timestamp } }
+        if !files.isEmpty || removedPaths { saveScanState() }
         return imported.count
     }
 
@@ -308,11 +349,13 @@ final class MetricStore {
             ) else { continue }
             for case let file as URL in enumerator where file.pathExtension == "jsonl" {
                 autoreleasepool {
-                    let parsed = parse(file: file)
+                    let parsed = parse(file: file, forceFull: true)
                     for metric in parsed.completed { rebuiltByID[metric.turnID] = metric }
                     for metric in parsed.apiCalls { rebuiltAPICallsByID[metric.id] = metric }
-                    if let pending = parsed.pending { rebuiltLive[file.path] = pending }
-                    if let activeAPI = parsed.activeAPI { rebuiltActiveAPIs[file.path] = activeAPI }
+                    if file.path.contains("/.codex/sessions/") {
+                        if let pending = parsed.pending { rebuiltLive[file.path] = pending }
+                        if let activeAPI = parsed.activeAPI { rebuiltActiveAPIs[file.path] = activeAPI }
+                    }
                     let values = try? file.resourceValues(forKeys: [.contentModificationDateKey])
                     rebuiltDates[file.path] = values?.contentModificationDate ?? .distantPast
                 }
@@ -338,27 +381,40 @@ final class MetricStore {
         return records.count
     }
 
-    private func parse(file: URL) -> ParseResult {
-        guard let text = try? String(contentsOf: file, encoding: .utf8) else {
+    private func parse(file: URL, forceFull: Bool = false) -> ParseResult {
+        guard let handle = try? FileHandle(forReadingFrom: file) else {
             return ParseResult(completed: [], pending: nil, apiCalls: [], activeAPI: nil)
         }
-        var pending: PendingTurn?
-        var pendingAPIState: PendingAPIState?
-        var completedAPIStateAwaitingUsage: PendingAPIState?
-        var pendingUsageRecord: PendingUsageRecord?
-        var pendingOperation: String?
+        defer { try? handle.close() }
+        guard let fileSize = try? handle.seekToEnd() else {
+            return ParseResult(completed: [], pending: nil, apiCalls: [], activeAPI: nil)
+        }
+        let previous = forceFull ? nil : parseCheckpointsBySource[file.path]
+        let checkpoint = previous.flatMap { $0.offset <= fileSize ? $0 : nil }
+        let startOffset = checkpoint?.offset ?? 0
+        guard (try? handle.seek(toOffset: startOffset)) != nil,
+              let bytes = try? handle.readToEnd() else {
+            return ParseResult(completed: [], pending: nil, apiCalls: [], activeAPI: nil)
+        }
+        let completeLength = bytes.lastIndex(of: 0x0a).map { $0 + 1 } ?? 0
+        let completeBytes = bytes.prefix(completeLength)
+        let endOffset = startOffset + UInt64(completeLength)
+        var pending = checkpoint?.pending
+        var pendingAPIState = checkpoint?.pendingAPIState
+        var completedAPIStateAwaitingUsage = checkpoint?.completedAPIStateAwaitingUsage
+        var pendingUsageRecord = checkpoint?.pendingUsageRecord
+        var pendingOperation = checkpoint?.pendingOperation
         var result: [RequestMetric] = []
         var apiCallResult: [APICallMetric] = []
-        var sessionID = file.deletingPathExtension().lastPathComponent.split(separator: "-").last.map(String.init) ?? file.lastPathComponent
-        var lastModel: String?
-        var lastEffort: String?
-        var lastServiceTier: String?
-        var sessionUsage = TokenUsage()
-        var latestTimestamp = ""
+        var sessionID = checkpoint?.sessionID ?? file.deletingPathExtension().lastPathComponent.split(separator: "-").last.map(String.init) ?? file.lastPathComponent
+        var lastModel = checkpoint?.lastModel
+        var lastEffort = checkpoint?.lastEffort
+        var lastServiceTier = checkpoint?.lastServiceTier
+        var sessionUsage = checkpoint?.sessionUsage ?? TokenUsage()
+        var latestTimestamp = checkpoint?.latestTimestamp ?? ""
 
-        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-            guard let data = line.data(using: .utf8),
-                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        for line in completeBytes.split(separator: 0x0a, omittingEmptySubsequences: true) {
+            guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
                   let type = object["type"] as? String else { continue }
             let timestamp = object["timestamp"] as? String ?? ""
             if !timestamp.isEmpty { latestTimestamp = timestamp }
@@ -559,6 +615,14 @@ final class MetricStore {
                 }
             }
         }
+        parseCheckpointsBySource[file.path] = ParseCheckpoint(
+            offset: endOffset, pending: pending, pendingAPIState: pendingAPIState,
+            completedAPIStateAwaitingUsage: completedAPIStateAwaitingUsage,
+            pendingUsageRecord: pendingUsageRecord, pendingOperation: pendingOperation,
+            sessionID: sessionID, lastModel: lastModel, lastEffort: lastEffort,
+            lastServiceTier: lastServiceTier, sessionUsage: sessionUsage,
+            latestTimestamp: latestTimestamp
+        )
         let live = pending.map {
             LiveRequest(
                 turnID: $0.id,
@@ -586,6 +650,13 @@ final class MetricStore {
         }
         return ParseResult(completed: result, pending: live, apiCalls: apiCallResult, activeAPI: activeAPI)
     }
+
+#if PRICING_TESTS
+    func parseForTesting(file: URL) -> (completedCount: Int, active: Bool) {
+        let result = parse(file: file)
+        return (result.completed.count, result.activeAPI != nil)
+    }
+#endif
 
     private func repairUnknownRecords() {
         let unknown = records.filter { $0.model == "未知" || $0.effort == "未知" }
@@ -1223,8 +1294,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let todayCalls = todayRecords.reduce(0) { $0 + ($1.modelCalls ?? 0) }
         let todayTokens = todayRecords.reduce(0) { $0 + $1.usage.total }
+        let todayAPICalls = store.apiCalls.filter { call in
+            guard let date = requestMetricDate(call.timestamp) else { return false }
+            return calendar.isDateInToday(date)
+        }
         popoverController.update(snapshot: snapshot, todayCalls: todayCalls, todayTokens: todayTokens,
-                                 todayCost: summedAPICost(todayRecords), refreshedAt: Date())
+                                 todayCost: summedAPICost(todayAPICalls), refreshedAt: Date())
         popoverController.updateTibo(tiboSnapshot)
         if let used = snapshot?.secondaryUsed ?? snapshot?.primaryUsed {
             statusItem.button?.title = " \(max(0, 100 - used))%"
@@ -1371,6 +1446,7 @@ private func shortDate(_ value: String) -> String {
     let f = DateFormatter(); f.locale = Locale(identifier: "zh_CN"); f.dateFormat = "MM-dd HH:mm:ss"; return f.string(from: date)
 }
 
+#if !PRICING_TESTS
 @main
 struct CodexPulseMain {
     static func main() {
@@ -1382,3 +1458,4 @@ struct CodexPulseMain {
         }
     }
 }
+#endif

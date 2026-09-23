@@ -10,7 +10,7 @@ private struct GroupStats {
     let output: Int
     let reasoning: Int
     let total: Int
-    let valueUSD: Double?
+    let cost: APICostSummary
     let typicalTTFT: Int
     let slowerTTFT: Int
     let averageDuration: Int
@@ -69,7 +69,7 @@ private struct StatsDateBounds {
     let includesEnd: Bool
 }
 
-final class StatsWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
+final class StatsWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSTabViewDelegate {
     private var allRecords: [RequestMetric] = []
     private var apiCalls: [APICallMetric] = []
     private var activeAPICalls: [ActiveAPICall] = []
@@ -98,6 +98,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
     private var consolePage = 0
     private var customDateBounds: StatsDateBounds?
     private var lastAppliedRangeIndex = StatsDateRange.today.rawValue
+    private var overviewNeedsRefresh = false
 
     var isLiveConsoleVisible: Bool {
         window?.isVisible == true && (tabs.selectedTabViewItem?.identifier as? String) == "console"
@@ -126,9 +127,14 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         self.apiCalls = apiCalls
         self.activeAPICalls = activeAPICalls
         self.sessionTitles = sessionTitles
-        rebuildFilterChoices()
-        applyFilters()
-        rebuildConsole()
+        if (tabs.selectedTabViewItem?.identifier as? String) == "console" {
+            overviewNeedsRefresh = true
+            rebuildConsole()
+        } else {
+            rebuildFilterChoices()
+            applyFilters()
+            overviewNeedsRefresh = false
+        }
     }
 
     func showOverview() {
@@ -161,6 +167,20 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         ])
         buildOverview(in: overview)
         buildConsole(in: console)
+        tabs.delegate = self
+    }
+
+    func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
+        switch tabViewItem?.identifier as? String {
+        case "overview" where overviewNeedsRefresh:
+            rebuildFilterChoices()
+            applyFilters()
+            overviewNeedsRefresh = false
+        case "console":
+            rebuildConsole(animated: false)
+        default:
+            break
+        }
     }
 
     private func buildOverview(in content: NSView) {
@@ -199,10 +219,10 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
 
         let calls = metricBox("API 请求", help: "每次产生非零 last_token_usage 的底层模型 API 调用", style: .primary)
         let total = metricBox("总 Token", help: nil, style: .primary, highlighted: true)
-        let value = metricBox("价值相当于", help: "按 OpenAI 标准 API Token 单价估算；不代表订阅套餐的实际账单", style: .primary, highlighted: true)
+        let value = metricBox("价值相当于", help: "逐次按模型、服务档位和长上下文 API 单价估算；未公布价格的调用不计入已知部分，不代表实际账单", style: .primary, highlighted: true)
         let typical = metricBox("典型首响应", help: "一半请求的首响应时间不超过这个值", style: .secondary)
         let slower = metricBox("P95 总耗时", help: "95% 的请求总耗时不超过这个值", style: .secondary)
-        let tokenRate = metricBox("Token 速率", help: "已完成调用的输出 Token ÷ 出字阶段耗时（总时长 − 首 Token）", style: .secondary)
+        let tokenRate = metricBox("Token 速率", help: "已完成调用的输出 Token ÷ 出字阶段耗时；不可靠的本地事件时序不参与计算", style: .secondary)
         let cache = metricBox("缓存命中率", help: "输入 Token 中由缓存直接复用的比例", style: .secondary)
         let reasoning = metricBox("推理占比", help: "输出 Token 中用于模型推理的比例", style: .secondary)
         summaryValues = [calls.1, total.1, value.1, typical.1, slower.1, tokenRate.1, cache.1, reasoning.1]
@@ -401,7 +421,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         addColumns([
             ("api_status", "状态", 64), ("api_operation", "类型", 56), ("api_time", "时间", 124),
             ("api_session", "会话", 140), ("api_model", "模型", 230),
-            ("api_effort", "等级", 55), ("api_fast", "Fast", 48),
+            ("api_effort", "等级", 55), ("api_fast", "加速档", 84),
             ("api_ttft", "首 Token", 72), ("api_duration", "总时长", 72),
             ("api_rate", "Token 速率", 86),
             ("api_input", "输入", 64),
@@ -719,7 +739,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
                 output: bucket.reduce(0) { $0 + $1.usage.output },
                 reasoning: bucket.reduce(0) { $0 + $1.usage.reasoning },
                 total: bucket.reduce(0) { $0 + $1.usage.total },
-                valueUSD: summedAPICost(bucket),
+                cost: summedAPICost(callsByGroup[key] ?? []),
                 typicalTTFT: percentile(ttfts, 0.50), slowerTTFT: percentile(ttfts, 0.95),
                 averageDuration: durations.isEmpty ? 0 : durations.reduce(0, +) / durations.count,
                 tokenRate: aggregateTokenRate(callsByGroup[key] ?? [])
@@ -735,10 +755,10 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         let reasoning = filteredRecords.reduce(0) { $0 + $1.usage.reasoning }
         let ttfts = filteredRecords.map(\.ttftMS).filter { $0 > 0 }
         let durations = filteredRecords.map(\.durationMS)
-        let valueUSD = summedAPICost(filteredRecords)
+        let cost = summedAPICost(filteredAPICalls)
         let modelCalls = filteredRecords.reduce(0) { $0 + ($1.modelCalls ?? 0) }
         let values = [compactNumber(modelCalls), compactNumber(total),
-                      formatUSD(valueUSD),
+                      formatAPICost(cost),
                       formatDuration(percentile(ttfts, 0.50)), formatDuration(percentile(durations, 0.95)),
                       formatTokenRate(aggregateTokenRate(filteredAPICalls)),
                       percent(input > 0 ? Double(cached) / Double(input) : 0),
@@ -802,7 +822,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         case "group": value = "\(stats.model) · \(stats.effort)"
         case "count": value = compactNumber(stats.modelCalls)
         case "total": value = compactNumber(stats.total)
-        case "value": value = formatUSD(stats.valueUSD)
+        case "value": value = formatAPICost(stats.cost)
         case "input": value = compactNumber(stats.input)
         case "output": value = compactNumber(stats.output)
         case "reasoning": value = compactNumber(stats.reasoning)
@@ -820,8 +840,8 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         case "input": cell.toolTip = fullNumber(stats.input) + " Token"
         case "output": cell.toolTip = fullNumber(stats.output) + " Token"
         case "reasoning": cell.toolTip = fullNumber(stats.reasoning) + " Token"
-        case "value": cell.toolTip = pricingTooltip(model: stats.model, value: stats.valueUSD)
-        case "rate": cell.toolTip = "该模型已完成调用的输出 Token ÷ 出字阶段总耗时；缺少完整时序的调用不参与计算"
+        case "value": cell.toolTip = costSummaryTooltip(stats.cost)
+        case "rate": cell.toolTip = "该模型已完成调用的输出 Token ÷ 出字阶段总耗时；缺少可信时序的调用不参与计算"
         default: cell.toolTip = nil
         }
         return cell
@@ -838,6 +858,10 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         let usage = item.usage
         let detailedUsage = usage.flatMap { usageHasBreakdown($0) ? $0 : nil }
         let pricedModel = item.responseModel ?? item.model
+        let unreliableTTFT = usage.map {
+            hasImplausibleEstimatedTTFT(outputTokens: $0.output, ttftMS: item.ttftMS,
+                                        durationMS: item.durationMS, estimated: item.ttftEstimated)
+        } ?? false
         let value: String
         switch id.rawValue {
         case "api_status": value = item.status.map { "● \($0)" } ?? "已完成"
@@ -846,7 +870,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         case "api_session": value = compactSessionTitle(item.sessionName)
         case "api_effort": value = item.effort
         case "api_fast": value = fastTierLabel(item.serviceTier)
-        case "api_ttft": value = item.operation == "compaction" ? "不适用" : timingLabel(item.ttftMS, estimated: item.ttftEstimated)
+        case "api_ttft": value = item.operation == "compaction" ? "不适用" : timingLabel(unreliableTTFT ? nil : item.ttftMS, estimated: item.ttftEstimated)
         case "api_duration": value = timingLabel(item.durationMS, estimated: item.durationEstimated)
         case "api_rate": value = item.operation == "compaction" ? "不适用" : formatTokenRate(item.tokenRate)
         case "api_input": value = detailedUsage.map { compactNumber($0.input) } ?? "--"
@@ -854,7 +878,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         case "api_output": value = detailedUsage.map { compactNumber($0.output) } ?? "--"
         case "api_reasoning": value = detailedUsage.map { compactNumber($0.reasoning) } ?? "--"
         case "api_total": value = usage.map { compactNumber($0.total) } ?? "--"
-        case "api_value": value = usage.map { formatUSD(estimatedAPICost(model: pricedModel, usage: $0)) } ?? "--"
+        case "api_value": value = usage.map { formatUSD(estimatedAPICost(model: pricedModel, serviceTier: item.serviceTier, usage: $0)) } ?? "--"
         default: value = ""
         }
         cell.textField?.stringValue = value
@@ -875,10 +899,12 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         } else if id.rawValue == "api_time" {
             cell.toolTip = item.timestamp
         } else if id.rawValue == "api_fast" {
-            cell.toolTip = item.serviceTier.map { "Codex service tier：\($0)" } ?? "旧记录未包含 service tier"
+            cell.toolTip = item.serviceTier.map { "Codex service tier：\($0)" } ?? "旧记录未包含 service tier；价值按标准档估算"
         } else if id.rawValue == "api_ttft" {
             if item.operation == "compaction" {
                 cell.toolTip = "上下文压缩没有可观测的首 Token，因而不适用"
+            } else if unreliableTTFT {
+                cell.toolTip = "Codex 只记录了响应完成事件，无法从本地日志可靠推断首 Token 时间"
             } else {
                 cell.toolTip = item.ttftMS.map {
                     item.ttftEstimated == true ? "根据本地事件边界推算的首响应：\($0)ms" : "Codex 记录的首 Token：\($0)ms"
@@ -893,7 +919,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
             } else {
                 cell.toolTip = item.tokenRate.map { _ in
                     "输出 Token ÷（总时长 − 首 Token），仅计算开始出字后的生成吞吐"
-                } ?? "缺少输出 Token、首 Token 或总时长，无法计算"
+                } ?? "缺少可靠的首 Token 或生成区间，无法计算 Token 速率"
             }
         } else if let usage, ["api_input", "api_cached", "api_output", "api_reasoning", "api_total"].contains(id.rawValue) {
             if id.rawValue != "api_total" && !usageHasBreakdown(usage) {
@@ -904,7 +930,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
             cell.toolTip = fullNumber(exact) + " Token"
         } else if id.rawValue == "api_value", let usage {
             cell.toolTip = usageHasBreakdown(usage)
-                ? pricingTooltip(model: pricedModel, value: estimatedAPICost(model: pricedModel, usage: usage))
+                ? pricingTooltip(model: pricedModel, serviceTier: item.serviceTier, usage: usage)
                 : "旧版记录缺少输入/缓存/输出拆分，无法可靠估算等价花费"
         } else { cell.toolTip = nil }
         return cell
@@ -1213,8 +1239,9 @@ private func formatDuration(_ milliseconds: Int) -> String {
 
 private func fastTierLabel(_ serviceTier: String?) -> String {
     switch serviceTier?.lowercased() {
-    case "priority", "fast": return "是"
-    case "default": return "否"
+    case "ultrafast": return "Ultra Fast"
+    case "priority", "fast": return "Fast"
+    case "default", "standard": return "标准"
     case .some(let value): return value
     case .none: return "--"
     }
@@ -1225,19 +1252,35 @@ private func timingLabel(_ milliseconds: Int?, estimated: Bool?) -> String {
     return (estimated == true ? "≈ " : "") + formatDuration(milliseconds)
 }
 
+private func hasImplausibleEstimatedTTFT(outputTokens: Int, ttftMS: Int?,
+                                         durationMS: Int?, estimated: Bool?) -> Bool {
+    guard estimated == true, outputTokens > 0,
+          let ttftMS, let durationMS, durationMS > ttftMS else { return false }
+    let generationMS = durationMS - ttftMS
+    return generationMS < 250 || Double(outputTokens) * 1_000 / Double(generationMS) > 1_000
+}
+
 private func tokenRate(for call: APICallMetric) -> Double? {
     guard call.usage.output > 0,
           let ttftMS = call.ttftMS,
           let durationMS = call.durationMS,
           durationMS > ttftMS else { return nil }
-    return Double(call.usage.output) * 1_000 / Double(durationMS - ttftMS)
+    let rate = Double(call.usage.output) * 1_000 / Double(durationMS - ttftMS)
+    // Some Codex logs emit only a completed-item event. Its timestamp is not a
+    // first-token timestamp, even though it can be just milliseconds before the
+    // end. Do not present the resulting tens-of-thousands tk/s as throughput.
+    guard !hasImplausibleEstimatedTTFT(outputTokens: call.usage.output,
+                                      ttftMS: ttftMS, durationMS: durationMS,
+                                      estimated: call.ttftEstimated) else { return nil }
+    return rate
 }
 
 private func aggregateTokenRate(_ calls: [APICallMetric]) -> Double? {
     var outputTokens = 0
     var generationMS = 0
     for call in calls {
-        guard call.usage.output > 0,
+        guard tokenRate(for: call) != nil,
+              call.usage.output > 0,
               let ttftMS = call.ttftMS,
               let durationMS = call.durationMS,
               durationMS > ttftMS else { continue }
@@ -1273,64 +1316,95 @@ private struct APIPrice {
     let input: Double
     let cached: Double
     let output: Double
+    let tier: String
+    let longContext: Bool
 }
 
 private func matchesModel(_ model: String, _ base: String) -> Bool {
     model == base || model.hasPrefix(base + "-20")
 }
 
-private func apiPrice(for rawModel: String) -> APIPrice? {
+private func apiPrice(for rawModel: String, serviceTier: String?, inputTokens: Int) -> APIPrice? {
     let model = rawModel.lowercased()
+    let tier = serviceTier?.lowercased() ?? "default"
+    guard tier != "ultrafast" else { return nil } // No published Ultrafast rate card.
+    guard ["default", "standard", "priority", "fast"].contains(tier) else { return nil }
+    let fast = tier == "priority" || tier == "fast"
+    let longContext = inputTokens > 272_000
+    let rateMultiplier = fast ? 2.0 : 1.0
+    let inputMultiplier = longContext ? 2.0 : 1.0
+    let outputMultiplier = longContext ? 1.5 : 1.0
+    let tierName = fast ? "Fast" : "标准"
+    func latest(_ name: String, _ input: Double, _ cached: Double, _ output: Double) -> APIPrice {
+        APIPrice(name: name, input: input * inputMultiplier * rateMultiplier,
+                 cached: cached * inputMultiplier * rateMultiplier,
+                 output: output * outputMultiplier * rateMultiplier,
+                 tier: tierName, longContext: longContext)
+    }
+    func standard(_ name: String, _ input: Double, _ cached: Double, _ output: Double) -> APIPrice? {
+        guard !fast else { return nil }
+        return APIPrice(name: name, input: input, cached: cached, output: output,
+                        tier: "标准", longContext: false)
+    }
     if matchesModel(model, "gpt-6-astra") {
-        return APIPrice(name: "GPT-6 Astra", input: 10, cached: 1, output: 50)
+        return latest("GPT-6 Astra", 10, 1, 50)
+    }
+    if matchesModel(model, "gpt-6-sol") {
+        return latest("GPT-6 Sol", 2, 0.2, 10)
+    }
+    if matchesModel(model, "gpt-6-luna") {
+        return latest("GPT-6 Luna", 0.1, 0.01, 0.5)
     }
     if matchesModel(model, "gpt-5.6-sol") || matchesModel(model, "gpt-5.6") {
-        return APIPrice(name: "GPT-5.6 Sol", input: 4, cached: 0.4, output: 20)
+        return latest("GPT-5.6 Sol", 4, 0.4, 20)
     }
     if matchesModel(model, "gpt-5.6-terra") {
-        return APIPrice(name: "GPT-5.6 Terra", input: 2, cached: 0.2, output: 12)
+        return latest("GPT-5.6 Terra", 2, 0.2, 12)
     }
     if matchesModel(model, "gpt-5.6-luna") {
-        return APIPrice(name: "GPT-5.6 Luna", input: 0.2, cached: 0.02, output: 1.2)
+        return latest("GPT-5.6 Luna", 0.2, 0.02, 1.2)
     }
     if matchesModel(model, "gpt-5.5-pro") {
-        return APIPrice(name: "GPT-5.5 Pro", input: 30, cached: 30, output: 180)
+        return standard("GPT-5.5 Pro", 30, 30, 180)
     }
     if matchesModel(model, "gpt-5.5") {
-        return APIPrice(name: "GPT-5.5", input: 5, cached: 0.5, output: 30)
+        return standard("GPT-5.5", 5, 0.5, 30)
     }
     if matchesModel(model, "gpt-5.4-pro") {
-        return APIPrice(name: "GPT-5.4 Pro", input: 30, cached: 30, output: 180)
+        return standard("GPT-5.4 Pro", 30, 30, 180)
     }
     if matchesModel(model, "gpt-5.4-mini") {
-        return APIPrice(name: "GPT-5.4 Mini", input: 0.75, cached: 0.075, output: 4.5)
+        return standard("GPT-5.4 Mini", 0.75, 0.075, 4.5)
     }
     if matchesModel(model, "gpt-5.4-nano") {
-        return APIPrice(name: "GPT-5.4 Nano", input: 0.2, cached: 0.02, output: 1.25)
+        return standard("GPT-5.4 Nano", 0.2, 0.02, 1.25)
     }
     if matchesModel(model, "gpt-5.4") {
-        return APIPrice(name: "GPT-5.4", input: 2.5, cached: 0.25, output: 15)
+        return standard("GPT-5.4", 2.5, 0.25, 15)
     }
     if matchesModel(model, "gpt-5.3-codex") || model == "codex-auto-review" {
-        return APIPrice(name: "GPT-5.3-Codex", input: 1.75, cached: 0.175, output: 14)
+        let multiplier = fast ? 2.0 : 1.0
+        return APIPrice(name: "GPT-5.3-Codex", input: 1.75 * multiplier,
+                        cached: 0.175 * multiplier, output: 14 * multiplier,
+                        tier: tierName, longContext: false)
     }
     if matchesModel(model, "gpt-5.2-pro") {
-        return APIPrice(name: "GPT-5.2 Pro", input: 21, cached: 21, output: 168)
+        return standard("GPT-5.2 Pro", 21, 21, 168)
     }
     if matchesModel(model, "gpt-5.2") || matchesModel(model, "gpt-5.2-codex") {
-        return APIPrice(name: "GPT-5.2", input: 1.75, cached: 0.175, output: 14)
+        return standard("GPT-5.2", 1.75, 0.175, 14)
     }
     if matchesModel(model, "gpt-5-codex") || matchesModel(model, "gpt-5") {
-        return APIPrice(name: "GPT-5", input: 1.25, cached: 0.125, output: 10)
+        return standard("GPT-5", 1.25, 0.125, 10)
     }
     if model == "codex-mini-latest" {
-        return APIPrice(name: "codex-mini-latest", input: 1.5, cached: 0.375, output: 6)
+        return standard("codex-mini-latest", 1.5, 0.375, 6)
     }
     return nil
 }
 
-private func estimatedAPICost(model: String, usage: TokenUsage) -> Double? {
-    guard let price = apiPrice(for: model) else { return nil }
+private func estimatedAPICost(model: String, serviceTier: String?, usage: TokenUsage) -> Double? {
+    guard let price = apiPrice(for: model, serviceTier: serviceTier, inputTokens: usage.input) else { return nil }
     guard usageHasBreakdown(usage) else { return nil }
     let cachedTokens = min(max(usage.cached, 0), max(usage.input, 0))
     let uncachedTokens = max(usage.input - cachedTokens, 0)
@@ -1343,10 +1417,38 @@ private func usageHasBreakdown(_ usage: TokenUsage) -> Bool {
     usage.total == 0 || usage.input > 0 || usage.output > 0
 }
 
-func summedAPICost(_ records: [RequestMetric]) -> Double? {
-    if records.isEmpty { return 0 }
-    let values = records.compactMap { estimatedAPICost(model: $0.model, usage: $0.usage) }
-    return values.isEmpty ? nil : values.reduce(0, +)
+struct APICostSummary {
+    let knownUSD: Double
+    let pricedCalls: Int
+    let unpricedCalls: Int
+}
+
+func summedAPICost(_ calls: [APICallMetric]) -> APICostSummary {
+    var knownUSD = 0.0
+    var pricedCalls = 0
+    var unpricedCalls = 0
+    for call in calls {
+        let model = call.responseModel ?? call.model
+        if let value = estimatedAPICost(model: model, serviceTier: call.serviceTier, usage: call.usage) {
+            knownUSD += value
+            pricedCalls += 1
+        } else {
+            unpricedCalls += 1
+        }
+    }
+    return APICostSummary(knownUSD: knownUSD, pricedCalls: pricedCalls, unpricedCalls: unpricedCalls)
+}
+
+func formatAPICost(_ summary: APICostSummary) -> String {
+    if summary.unpricedCalls == 0 { return formatUSD(summary.knownUSD) }
+    if summary.pricedCalls == 0 { return "未定价" }
+    return "≥ " + formatUSD(summary.knownUSD).replacingOccurrences(of: "≈ ", with: "")
+}
+
+private func costSummaryTooltip(_ summary: APICostSummary) -> String {
+    let known = "已按对应 API 档位计价 \(summary.pricedCalls) 次：\(formatUSD(summary.knownUSD))。"
+    if summary.unpricedCalls == 0 { return known + "\n估算值不代表订阅套餐或第三方渠道的实际账单。" }
+    return known + "\n另有 \(summary.unpricedCalls) 次价格未知（如 Ultra Fast 未公布单价、第三方模型或缺少 Token 拆分）；显示的是已知部分下限，不代表实际账单。"
 }
 
 func formatUSD(_ value: Double?) -> String {
@@ -1357,15 +1459,56 @@ func formatUSD(_ value: Double?) -> String {
     return String(format: "≈ $%.2fM", value / 1_000_000)
 }
 
-private func pricingTooltip(model: String, value: Double?) -> String {
-    guard let price = apiPrice(for: model) else {
-        return "没有可匹配的 OpenAI 官方 API 价格，暂不估算"
+private func pricingTooltip(model: String, serviceTier: String?, usage: TokenUsage) -> String {
+    if serviceTier?.lowercased() == "ultrafast" {
+        return "Ultra Fast 目前为限量预览，OpenAI 尚未公布该档位的每百万 Token 单价；不能沿用标准或 Fast 价。"
     }
-    guard let value else { return "该调用缺少输入与输出 Token 拆分，无法可靠估算价值" }
+    guard let price = apiPrice(for: model, serviceTier: serviceTier, inputTokens: usage.input) else {
+        return "没有可匹配的该模型／服务档位官方 API 价格，暂不估算；第三方渠道可能另有报价。"
+    }
+    guard let value = estimatedAPICost(model: model, serviceTier: serviceTier, usage: usage) else {
+        return "该调用缺少输入与输出 Token 拆分，无法可靠估算价值"
+    }
     let mapping = model.lowercased() == "codex-auto-review" ? "；codex-auto-review 按 GPT-5.3-Codex 计算" : ""
-    return String(format: "%@ 标准 API 价：输入 $%.3g/M · 缓存 $%.3g/M · 输出 $%.3g/M%@\n（总输入 − 缓存输入）× 输入价 + 缓存输入 × 缓存价 + 输出 × 输出价\n估算价值 %@，不代表订阅套餐的实际账单",
-                  price.name, price.input, price.cached, price.output, mapping, formatUSD(value))
+    let context = price.longContext ? "长上下文" : "普通上下文"
+    return String(format: "%@ · %@ · %@ API 价：输入 $%.3g/M · 缓存 $%.3g/M · 输出 $%.3g/M%@\n（总输入 − 缓存输入）× 输入价 + 缓存输入 × 缓存价 + 输出 × 输出价\n估算价值 %@；未计不可观测的缓存写入和工具费，不代表实际账单",
+                  price.name, price.tier, context, price.input, price.cached, price.output, mapping, formatUSD(value))
 }
+
+#if PRICING_TESTS
+func runPricingRegressionTests() {
+    func approx(_ actual: Double?, _ expected: Double) {
+        assert(actual.map { abs($0 - expected) < 0.000_001 } == true,
+               "Expected \(expected), got \(String(describing: actual))")
+    }
+    let short = TokenUsage(input: 200_000, cached: 100_000, output: 10_000,
+                           reasoning: 0, total: 210_000)
+    approx(estimatedAPICost(model: "gpt-6-sol", serviceTier: "default", usage: short), 0.32)
+    approx(estimatedAPICost(model: "gpt-6-sol", serviceTier: "fast", usage: short), 0.64)
+    approx(estimatedAPICost(model: "gpt-6-luna", serviceTier: "default", usage: short), 0.016)
+    let long = TokenUsage(input: 300_000, cached: 100_000, output: 10_000,
+                          reasoning: 0, total: 310_000)
+    approx(estimatedAPICost(model: "gpt-6-sol", serviceTier: "default", usage: long), 0.99)
+    approx(estimatedAPICost(model: "gpt-5.6-sol", serviceTier: "priority", usage: long), 3.96)
+    assert(estimatedAPICost(model: "gpt-5.6-sol", serviceTier: "ultrafast", usage: short) == nil)
+    assert(estimatedAPICost(model: "zai-org/GLM-5.3-Flash", serviceTier: "default", usage: short) == nil)
+    func call(_ model: String, _ tier: String?, _ usage: TokenUsage, _ ttft: Int = 0, _ duration: Int = 0) -> APICallMetric {
+        APICallMetric(id: model, sessionID: "s", turnID: "t", timestamp: "2026-09-23T00:00:00Z",
+                      model: model, responseModel: nil, effort: "medium", serviceTier: tier,
+                      ttftMS: ttft, ttftEstimated: true, durationMS: duration,
+                      durationEstimated: true, operation: nil, usage: usage, source: "test")
+    }
+    let summary = summedAPICost([call("gpt-6-sol", "default", short),
+                                 call("gpt-5.6-sol", "ultrafast", short)])
+    approx(summary.knownUSD, 0.32)
+    assert(summary.pricedCalls == 1 && summary.unpricedCalls == 1)
+    assert(formatAPICost(summary) == "≥ $0.32")
+    let bogusRate = call("gpt-5.6-sol", "ultrafast", short, 13_860, 13_870)
+    assert(tokenRate(for: bogusRate) == nil)
+    let credibleRate = call("gpt-5.6-sol", "ultrafast", short, 1_000, 11_000)
+    approx(tokenRate(for: credibleRate), 1_000)
+}
+#endif
 
 private func niceTokenScale(_ maximum: Int) -> (maximum: Double, step: Double) {
     let rawStep = max(Double(maximum) / 4, 1)

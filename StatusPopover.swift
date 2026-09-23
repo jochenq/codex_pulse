@@ -100,7 +100,7 @@ final class StatusPopoverController: NSViewController {
     }
 
     func update(snapshot: RateLimitReader.Snapshot?, todayCalls: Int, todayTokens: Int,
-                todayCost: Double?, refreshedAt: Date) {
+                todayCost: APICostSummary, refreshedAt: Date) {
         setRefreshing(false)
         let mainUsed = snapshot?.secondaryUsed ?? snapshot?.primaryUsed
         let mainMinutes = snapshot?.secondaryUsed != nil ? snapshot?.secondaryMinutes : snapshot?.primaryMinutes
@@ -129,7 +129,10 @@ final class StatusPopoverController: NSViewController {
 
         callsValue.stringValue = compactNumber(todayCalls)
         tokensValue.stringValue = compactNumber(todayTokens)
-        costValue.stringValue = formatUSD(todayCost)
+        costValue.stringValue = formatAPICost(todayCost)
+        costValue.toolTip = todayCost.unpricedCalls == 0
+            ? "逐次按对应 API 单价估算，不代表实际账单"
+            : "另有 \(todayCost.unpricedCalls) 次调用未定价；此处仅显示已知部分的下限"
         updatedLabel.stringValue = "更新于 " + timeOnly(refreshedAt)
     }
 
