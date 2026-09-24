@@ -106,13 +106,13 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
 
     init(records: [RequestMetric], apiCalls: [APICallMetric], activeAPICalls: [ActiveAPICall], sessionTitles: [String: String]) {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1100, height: 740),
+            contentRect: NSRect(x: 0, y: 0, width: 1180, height: 740),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "Codex Pulse"
-        window.minSize = NSSize(width: 920, height: 620)
+        window.minSize = NSSize(width: 1040, height: 620)
         window.isReleasedWhenClosed = false
         super.init(window: window)
         buildInterface()
@@ -416,18 +416,14 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
     private func configureConsoleTable() {
         consoleTable.delegate = self
         consoleTable.dataSource = self
-        consoleTable.usesAlternatingRowBackgroundColors = true
-        consoleTable.rowHeight = 32
+        consoleTable.usesAlternatingRowBackgroundColors = false
+        consoleTable.gridStyleMask = [.solidHorizontalGridLineMask]
+        consoleTable.gridColor = NSColor.separatorColor.withAlphaComponent(0.22)
+        consoleTable.rowHeight = 58
         addColumns([
-            ("api_status", "状态", 64), ("api_operation", "类型", 56), ("api_time", "时间", 124),
-            ("api_session", "会话", 140), ("api_model", "模型", 230),
-            ("api_effort", "等级", 55), ("api_fast", "加速档", 84),
-            ("api_ttft", "首 Token", 72), ("api_duration", "总时长", 72),
-            ("api_rate", "Token 速率", 86),
-            ("api_input", "输入", 64),
-            ("api_cached", "缓存", 64), ("api_output", "输出", 60),
-            ("api_reasoning", "推理", 60), ("api_total", "总 Token", 70),
-            ("api_value", "价值", 74)
+            ("api_event", "事件", 122), ("api_session", "会话", 164),
+            ("api_model", "模型配置", 226), ("api_performance", "响应表现", 188),
+            ("api_usage", "Token 用量", 250), ("api_value", "价值", 96)
         ], to: consoleTable)
     }
 
@@ -694,9 +690,17 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         for row in oldRows { oldByID[row.id] = row }
         let contentChanges = IndexSet(newRows.indices.filter {
             guard let old = oldByID[newRows[$0].id] else { return false }
-            return old.status != newRows[$0].status
-                || old.model != newRows[$0].model
-                || old.responseModel != newRows[$0].responseModel
+            let new = newRows[$0]
+            return old.status != new.status || old.model != new.model
+                || old.responseModel != new.responseModel || old.effort != new.effort
+                || old.serviceTier != new.serviceTier || old.ttftMS != new.ttftMS
+                || old.durationMS != new.durationMS || old.tokenRate != new.tokenRate
+                || old.operation != new.operation || old.sessionName != new.sessionName
+                || old.usage?.input != new.usage?.input
+                || old.usage?.cached != new.usage?.cached
+                || old.usage?.output != new.usage?.output
+                || old.usage?.reasoning != new.usage?.reasoning
+                || old.usage?.total != new.usage?.total
         })
         consoleRows = newRows
         if !removals.isEmpty || !insertions.isEmpty {
@@ -809,7 +813,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
 
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
         guard tableView === consoleTable, row < consoleRows.count else { return tableView.rowHeight }
-        return consoleRows[row].hasModelMismatch ? 50 : 32
+        return consoleRows[row].hasModelMismatch ? 74 : 58
     }
 
     private func statsCell(column: NSTableColumn, row: Int) -> NSView? {
@@ -854,85 +858,72 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         if id.rawValue == "api_model" {
             return consoleModelCell(item: item, identifier: id)
         }
-        let cell = reusableCell(in: consoleTable, id: id)
-        let usage = item.usage
-        let detailedUsage = usage.flatMap { usageHasBreakdown($0) ? $0 : nil }
-        let pricedModel = item.responseModel ?? item.model
-        let unreliableTTFT = usage.map {
-            hasImplausibleEstimatedTTFT(outputTokens: $0.output, ttftMS: item.ttftMS,
-                                        durationMS: item.durationMS, estimated: item.ttftEstimated)
-        } ?? false
-        let value: String
-        switch id.rawValue {
-        case "api_status": value = item.status.map { "● \($0)" } ?? "已完成"
-        case "api_operation": value = item.operation == "compaction" ? "压缩" : "模型"
-        case "api_time": value = clockLabel(item.timestamp)
-        case "api_session": value = compactSessionTitle(item.sessionName)
-        case "api_effort": value = item.effort
-        case "api_fast": value = fastTierLabel(item.serviceTier)
-        case "api_ttft": value = item.operation == "compaction" ? "不适用" : timingLabel(unreliableTTFT ? nil : item.ttftMS, estimated: item.ttftEstimated)
-        case "api_duration": value = timingLabel(item.durationMS, estimated: item.durationEstimated)
-        case "api_rate": value = item.operation == "compaction" ? "不适用" : formatTokenRate(item.tokenRate)
-        case "api_input": value = detailedUsage.map { compactNumber($0.input) } ?? "--"
-        case "api_cached": value = detailedUsage.map { compactNumber($0.cached) } ?? "--"
-        case "api_output": value = detailedUsage.map { compactNumber($0.output) } ?? "--"
-        case "api_reasoning": value = detailedUsage.map { compactNumber($0.reasoning) } ?? "--"
-        case "api_total": value = usage.map { compactNumber($0.total) } ?? "--"
-        case "api_value": value = usage.map { formatUSD(estimatedAPICost(model: pricedModel, serviceTier: item.serviceTier, usage: $0)) } ?? "--"
-        default: value = ""
-        }
-        cell.textField?.stringValue = value
-        cell.textField?.alignment = ["api_ttft", "api_duration", "api_rate", "api_input", "api_cached", "api_output", "api_reasoning", "api_total", "api_value"].contains(id.rawValue) ? .right : .left
-        if id.rawValue == "api_status" {
-            cell.textField?.textColor = item.status != nil ? .controlAccentColor : .secondaryLabelColor
-        } else if id.rawValue == "api_operation", item.operation == "compaction" {
-            cell.textField?.textColor = .systemOrange
-        } else {
-            cell.textField?.textColor = .labelColor
-        }
         if id.rawValue == "api_session" {
+            let cell = reusableCell(in: consoleTable, id: id)
+            cell.textField?.stringValue = compactSessionTitle(item.sessionName)
+            cell.textField?.font = .systemFont(ofSize: 11, weight: .medium)
+            cell.textField?.textColor = .labelColor
+            cell.textField?.alignment = .left
             cell.toolTip = item.sessionName
-        } else if id.rawValue == "api_operation" {
-            cell.toolTip = item.operation == "compaction"
-                ? "Codex 上下文压缩调用；具备完整用量时会计入 Token 和等价花费"
-                : "普通模型调用"
-        } else if id.rawValue == "api_time" {
-            cell.toolTip = item.timestamp
-        } else if id.rawValue == "api_fast" {
-            cell.toolTip = item.serviceTier.map { "Codex service tier：\($0)" } ?? "旧记录未包含 service tier；价值按标准档估算"
-        } else if id.rawValue == "api_ttft" {
-            if item.operation == "compaction" {
-                cell.toolTip = "上下文压缩没有可观测的首 Token，因而不适用"
-            } else if unreliableTTFT {
-                cell.toolTip = "Codex 只记录了响应完成事件，无法从本地日志可靠推断首 Token 时间"
+            return cell
+        }
+
+        let cell = (consoleTable.makeView(withIdentifier: id, owner: self) as? ConsoleDetailCellView)
+            ?? ConsoleDetailCellView()
+        cell.identifier = id
+        switch id.rawValue {
+        case "api_event":
+            let kind = item.operation == "compaction" ? "压缩" : "模型调用"
+            cell.configure(primary: item.status.map { "● \($0)" } ?? "已完成",
+                           secondary: "\(clockLabel(item.timestamp)) · \(kind)",
+                           primaryColor: item.status != nil ? .controlAccentColor : .labelColor,
+                           secondaryColor: item.operation == "compaction" ? .systemOrange : .secondaryLabelColor,
+                           toolTip: "\(item.timestamp)\n\(kind) · \(item.status ?? "已完成")")
+        case "api_performance":
+            let compacting = item.operation == "compaction"
+            let unreliableTTFT = item.usage.map {
+                hasImplausibleEstimatedTTFT(outputTokens: $0.output, ttftMS: item.ttftMS,
+                                            durationMS: item.durationMS, estimated: item.ttftEstimated)
+            } ?? false
+            let first = compacting ? "不适用" : timingLabel(unreliableTTFT ? nil : item.ttftMS, estimated: item.ttftEstimated)
+            let duration = timingLabel(item.durationMS, estimated: item.durationEstimated)
+            let rate = compacting ? "不适用" : formatTokenRate(item.tokenRate)
+            let details = compacting
+                ? "上下文压缩没有可观测的首 Token 或流式生成区间"
+                : unreliableTTFT ? "首 Token 事件不可靠，已隐藏估算；速率仅在可信时序下计算"
+                : "首 Token \(item.ttftMS.map { "\($0)ms" } ?? "未知") · 总时长 \(item.durationMS.map { "\($0)ms" } ?? "未知")\n速率 = 输出 Token ÷ 出字阶段耗时"
+            cell.configure(primary: compacting ? "总 \(duration)" : "首 \(first)  ·  总 \(duration)",
+                           secondary: "速率 \(rate)", toolTip: details)
+        case "api_usage":
+            if let usage = item.usage {
+                let hasDetails = usageHasBreakdown(usage)
+                let breakdown = hasDetails
+                    ? "入 \(compactNumber(usage.input))  ·  缓 \(compactNumber(usage.cached))  ·  出 \(compactNumber(usage.output))  ·  推 \(compactNumber(usage.reasoning))"
+                    : "旧记录无输入 / 缓存 / 输出明细"
+                let details = hasDetails
+                    ? "总 \(fullNumber(usage.total)) · 输入 \(fullNumber(usage.input)) · 缓存输入 \(fullNumber(usage.cached)) · 输出 \(fullNumber(usage.output)) · 推理 \(fullNumber(usage.reasoning)) Token\n缓存是输入的子集，推理是输出的子集"
+                    : "总 \(fullNumber(usage.total)) Token；旧记录无法可靠拆分用量"
+                cell.configure(primary: "总 \(compactNumber(usage.total)) Token", secondary: breakdown,
+                               primaryColor: .labelColor, toolTip: details)
             } else {
-                cell.toolTip = item.ttftMS.map {
-                    item.ttftEstimated == true ? "根据本地事件边界推算的首响应：\($0)ms" : "Codex 记录的首 Token：\($0)ms"
-                } ?? "本次调用缺少可关联的首响应时间"
+                cell.configure(primary: "--", secondary: "等待用量回报", toolTip: "进行中的调用尚无 Token 用量")
             }
-        } else if id.rawValue == "api_duration" {
-            cell.toolTip = item.durationMS.map { "根据本地事件边界推算的模型调用总时长：\($0)ms" }
-                ?? "本次调用缺少可关联的结束时间"
-        } else if id.rawValue == "api_rate" {
-            if item.operation == "compaction" {
-                cell.toolTip = "上下文压缩没有可观测的流式生成区间，Token 速率不适用"
-            } else {
-                cell.toolTip = item.tokenRate.map { _ in
-                    "输出 Token ÷（总时长 − 首 Token），仅计算开始出字后的生成吞吐"
-                } ?? "缺少可靠的首 Token 或生成区间，无法计算 Token 速率"
-            }
-        } else if let usage, ["api_input", "api_cached", "api_output", "api_reasoning", "api_total"].contains(id.rawValue) {
-            if id.rawValue != "api_total" && !usageHasBreakdown(usage) {
-                cell.toolTip = "旧版 Codex 记录只提供总 Token，无法可靠拆分输入、缓存、输出与推理"
-                return cell
-            }
-            let exact: Int = id.rawValue == "api_input" ? usage.input : id.rawValue == "api_cached" ? usage.cached : id.rawValue == "api_output" ? usage.output : id.rawValue == "api_reasoning" ? usage.reasoning : usage.total
-            cell.toolTip = fullNumber(exact) + " Token"
-        } else if id.rawValue == "api_value", let usage {
-            cell.toolTip = usageHasBreakdown(usage)
-                ? pricingTooltip(model: pricedModel, serviceTier: item.serviceTier, usage: usage)
-                : "旧版记录缺少输入/缓存/输出拆分，无法可靠估算等价花费"
-        } else { cell.toolTip = nil }
+        case "api_value":
+            let usage = item.usage
+            let model = item.responseModel ?? item.model
+            let cost = usage.flatMap { estimatedAPICost(model: model, serviceTier: item.serviceTier, usage: $0) }
+            let subtitle = usage == nil ? "等待完成" : cost == nil ? "未定价" : "API 等价"
+            let tip = usage.map {
+                usageHasBreakdown($0)
+                    ? pricingTooltip(model: model, serviceTier: item.serviceTier, usage: $0)
+                    : "旧版记录缺少输入/缓存/输出拆分，无法可靠估算等价花费"
+            } ?? "进行中的调用尚无 Token 用量"
+            cell.configure(primary: formatUSD(cost), secondary: subtitle,
+                           primaryColor: cost == nil ? .secondaryLabelColor : .labelColor,
+                           toolTip: tip)
+        default:
+            cell.configure(primary: "", secondary: "")
+        }
         return cell
     }
 
@@ -941,7 +932,8 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         let cell = (consoleTable.makeView(withIdentifier: identifier, owner: self) as? ConsoleModelCellView)
             ?? ConsoleModelCellView()
         cell.identifier = identifier
-        cell.configure(requestedModel: item.model, responseModel: item.responseModel)
+        cell.configure(requestedModel: item.model, responseModel: item.responseModel,
+                       effort: item.effort, serviceTier: item.serviceTier)
         return cell
     }
 
@@ -965,22 +957,76 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
     }
 }
 
+private final class ConsoleDetailCellView: NSTableCellView {
+    private let primaryLabel = NSTextField(labelWithString: "")
+    private let secondaryLabel = NSTextField(labelWithString: "")
+    private let contentStack: NSStackView
+
+    override init(frame frameRect: NSRect) {
+        contentStack = NSStackView(views: [primaryLabel, secondaryLabel])
+        super.init(frame: frameRect)
+        primaryLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+        secondaryLabel.font = .systemFont(ofSize: 10, weight: .regular)
+        for label in [primaryLabel, secondaryLabel] {
+            label.lineBreakMode = .byTruncatingTail
+            label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        }
+        contentStack.orientation = .vertical
+        contentStack.alignment = .leading
+        contentStack.spacing = 4
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(contentStack)
+        NSLayoutConstraint.activate([
+            contentStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
+            contentStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
+            contentStack.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func configure(primary: String, secondary: String,
+                   primaryColor: NSColor = .labelColor,
+                   secondaryColor: NSColor = .secondaryLabelColor,
+                   toolTip: String? = nil) {
+        primaryLabel.stringValue = primary
+        primaryLabel.textColor = primaryColor
+        secondaryLabel.stringValue = secondary
+        secondaryLabel.textColor = secondaryColor
+        self.toolTip = toolTip
+        setAccessibilityLabel(primary + "; " + secondary)
+    }
+}
+
 private final class ConsoleModelCellView: NSTableCellView {
     private let requestedLabel = NSTextField(labelWithString: "")
+    private let effortLabel = NSTextField(labelWithString: "")
+    private let tierIcon = NSImageView()
     private let responseLabel = NSTextField(labelWithString: "")
     private let mismatchBadge = MismatchBadgeView()
+    private let metadataRow: NSStackView
     private let responseRow: NSStackView
     private let contentStack: NSStackView
 
     override init(frame frameRect: NSRect) {
+        metadataRow = NSStackView(views: [effortLabel, tierIcon])
         responseRow = NSStackView(views: [responseLabel, mismatchBadge])
-        contentStack = NSStackView(views: [requestedLabel, responseRow])
+        contentStack = NSStackView(views: [requestedLabel, metadataRow, responseRow])
         super.init(frame: frameRect)
 
         requestedLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
         requestedLabel.textColor = .labelColor
         requestedLabel.lineBreakMode = .byTruncatingTail
         requestedLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        effortLabel.font = .systemFont(ofSize: 10, weight: .medium)
+        effortLabel.textColor = .secondaryLabelColor
+        tierIcon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
+        tierIcon.contentTintColor = .systemYellow
+        tierIcon.setContentHuggingPriority(.required, for: .horizontal)
+        metadataRow.orientation = .horizontal
+        metadataRow.alignment = .centerY
+        metadataRow.spacing = 5
 
         responseLabel.font = .monospacedDigitSystemFont(ofSize: 10, weight: .regular)
         responseLabel.textColor = .systemOrange
@@ -998,27 +1044,34 @@ private final class ConsoleModelCellView: NSTableCellView {
         contentStack.translatesAutoresizingMaskIntoConstraints = false
         addSubview(contentStack)
         NSLayoutConstraint.activate([
-            contentStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
-            contentStack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -4),
+            contentStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
+            contentStack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -6),
             contentStack.centerYAnchor.constraint(equalTo: centerYAnchor)
         ])
     }
 
     required init?(coder: NSCoder) { nil }
 
-    func configure(requestedModel: String, responseModel: String?) {
+    func configure(requestedModel: String, responseModel: String?, effort: String, serviceTier: String?) {
         requestedLabel.stringValue = requestedModel
+        effortLabel.stringValue = "思考 · \(effort)"
+        let tier = serviceTier?.lowercased()
+        let symbol = tier == "ultrafast" ? "bolt.circle.fill"
+            : ["priority", "fast"].contains(tier ?? "") ? "bolt.fill" : nil
+        tierIcon.image = symbol.flatMap { NSImage(systemSymbolName: $0, accessibilityDescription: fastTierLabel(serviceTier)) }
+        tierIcon.isHidden = tierIcon.image == nil
+        let tierDescription = serviceTier.map { fastTierLabel($0) } ?? "档位未知"
         guard let responseModel,
               normalizedModelName(requestedModel) != normalizedModelName(responseModel) else {
             responseRow.isHidden = true
             toolTip = responseModel == nil
-                ? "本地事件未包含上游响应模型；当前显示请求配置模型"
-                : "请求模型与上游响应模型一致：\(requestedModel)"
+                ? "请求模型：\(requestedModel)\n思考等级：\(effort) · \(tierDescription)\n本地事件未包含上游响应模型"
+                : "请求模型与上游响应模型一致：\(requestedModel)\n思考等级：\(effort) · \(tierDescription)"
             return
         }
         responseLabel.stringValue = "↳ 上游响应：\(responseModel)"
         responseRow.isHidden = false
-        toolTip = "请求模型：\(requestedModel)\n上游响应模型：\(responseModel)"
+        toolTip = "请求模型：\(requestedModel)\n上游响应模型：\(responseModel)\n思考等级：\(effort) · \(tierDescription)"
     }
 }
 
