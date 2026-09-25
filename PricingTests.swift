@@ -5,6 +5,7 @@ import Foundation
 struct PricingTests {
     static func main() {
         runPricingRegressionTests()
+        StatsWindowController.runOverviewRegressionTests()
         runIncrementalParserRegressionTest()
         print("Pricing and incremental parser regression tests passed")
     }

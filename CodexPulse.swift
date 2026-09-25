@@ -2,7 +2,7 @@ import AppKit
 import Foundation
 import SQLite3
 
-struct TokenUsage: Codable {
+struct TokenUsage: Codable, Equatable {
     var input = 0
     var cached = 0
     var output = 0
@@ -22,7 +22,7 @@ struct RequestMetric: Codable {
     let source: String
 }
 
-struct LiveRequest {
+struct LiveRequest: Equatable {
     let turnID: String
     let timestamp: String
     let model: String
@@ -65,6 +65,17 @@ struct ActiveAPICall {
     let durationEstimated: Bool?
     let status: String
     let source: String
+}
+
+struct StatsDataSnapshot {
+    let revision: Int
+    let dayStart: Date
+    let records: [RequestMetric]
+    let liveRequests: [LiveRequest]
+    let apiCalls: [APICallMetric]
+    let activeAPICalls: [ActiveAPICall]
+    let compactionCount: Int
+    let sessionTitles: [String: String]
 }
 
 private struct PendingTurn {
@@ -119,6 +130,7 @@ private struct ParseCheckpoint {
 final class MetricStore {
     private(set) var records: [RequestMetric] = []
     private(set) var apiCalls: [APICallMetric] = []
+    private(set) var revision = 0
     private var knownIDs = Set<String>()
     private var knownAPICallIDs = Set<String>()
     private let decoder = JSONDecoder()
@@ -138,28 +150,21 @@ final class MetricStore {
     private let apiCallResponseModelMigrationKey = "api-call-response-model-v5"
 
     var liveRequests: [LiveRequest] {
-        let cutoff = Date().addingTimeInterval(-6 * 60 * 60)
-        let withFractions = ISO8601DateFormatter()
-        withFractions.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let plain = ISO8601DateFormatter()
+        let idleCutoff = Date().addingTimeInterval(-5 * 60)
         return liveBySource.values.filter {
-            guard let date = withFractions.date(from: $0.timestamp) ?? plain.date(from: $0.timestamp) else { return false }
-            return date >= cutoff
+            guard let lastModified = scannedModificationDates[$0.source],
+                  lastModified >= idleCutoff else { return false }
+            return FileManager.default.fileExists(atPath: $0.source)
         }.sorted { $0.timestamp > $1.timestamp }
     }
 
     var activeAPICalls: [ActiveAPICall] {
-        let cutoff = Date().addingTimeInterval(-6 * 60 * 60)
-        let withFractions = ISO8601DateFormatter()
-        withFractions.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let plain = ISO8601DateFormatter()
         let idleCutoff = Date().addingTimeInterval(-5 * 60)
         let recent = activeAPIBySource.values.filter {
-            guard let date = withFractions.date(from: $0.timestamp) ?? plain.date(from: $0.timestamp) else { return false }
             guard let lastModified = scannedModificationDates[$0.source],
                   lastModified >= idleCutoff,
                   FileManager.default.fileExists(atPath: $0.source) else { return false }
-            return date >= cutoff
+            return true
         }
         var uniqueByID: [String: ActiveAPICall] = [:]
         for call in recent {
@@ -292,10 +297,12 @@ final class MetricStore {
         // Drop its cached row instead of leaving a ghost request at the top.
         let idleCutoff = Date().addingTimeInterval(-5 * 60)
         let livePaths = Set(activeAPIBySource.keys).union(liveBySource.keys)
+        var removedLiveState = false
         for path in livePaths
             where !visiblePaths.contains(path)
                 || !path.contains("/.codex/sessions/")
                 || (scannedModificationDates[path] ?? .distantPast) < idleCutoff {
+            removedLiveState = true
             activeAPIBySource.removeValue(forKey: path)
             liveBySource.removeValue(forKey: path)
         }
@@ -326,7 +333,10 @@ final class MetricStore {
         importedAPICalls.sort { $0.timestamp < $1.timestamp }
         for metric in importedAPICalls { appendAPICall(metric) }
         if !importedAPICalls.isEmpty { apiCalls.sort { $0.timestamp > $1.timestamp } }
-        if !files.isEmpty || removedPaths { saveScanState() }
+        if !files.isEmpty || removedPaths || removedLiveState {
+            revision &+= 1
+            saveScanState()
+        }
         return imported.count
     }
 
@@ -364,6 +374,7 @@ final class MetricStore {
         records = Array(rebuiltByID.values).sorted { $0.timestamp > $1.timestamp }
         knownIDs = Set(rebuiltByID.keys)
         apiCalls = Array(rebuiltAPICallsByID.values).sorted { $0.timestamp > $1.timestamp }
+        revision &+= 1
         knownAPICallIDs = Set(rebuiltAPICallsByID.keys)
         liveBySource = rebuiltLive
         activeAPIBySource = rebuiltActiveAPIs
@@ -1103,6 +1114,12 @@ final class RateLimitReader {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private struct PopoverMetrics {
+        let todayCalls: Int
+        let todayTokens: Int
+        let todayCost: APICostSummary
+    }
+
     private let store = MetricStore()
     private let rateReader = RateLimitReader()
     private let tiboMonitor = TiboMonitor()
@@ -1118,6 +1135,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isLivePolling = false
     private let storeQueue = DispatchQueue(label: "com.codexpulse.metric-store", qos: .utility)
     private var statsController: StatsWindowController?
+    private var latestStatsData: StatsDataSnapshot?
+    private var pendingShowStats = false
     private var aiConfigurationController: AIConfigurationWindowController?
     private var popover: NSPopover!
     private var popoverController: StatusPopoverController!
@@ -1150,6 +1169,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover.behavior = .transient
         popover.animates = true
         popover.contentViewController = popoverController
+        // Build the AppKit hierarchy at launch, outside the status button click path.
+        _ = popoverController.view
+        popoverController.updateTibo(tiboSnapshot)
         outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             DispatchQueue.main.async { self?.popover.performClose(nil) }
         }
@@ -1237,12 +1259,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         storeQueue.async { [weak self] in
             guard let self else { return }
             _ = self.store.importCodexHistory()
+            let metrics = self.todayPopoverMetrics()
+            let statsData = self.makeStatsSnapshot()
             self.rateReader.read(force: force) { snapshot in
                 DispatchQueue.main.async {
                     self.snapshot = snapshot ?? self.snapshot
                     self.isRefreshing = false
                     self.hasLoadedOnce = true
-                    self.updateUI()
+                    self.updateUI(metrics: metrics, statsData: statsData)
                     let shouldRefreshAgain = self.queuedManualRefresh
                     self.queuedManualRefresh = false
                     if CommandLine.arguments.contains("--show-popover"), !self.popover.isShown {
@@ -1257,20 +1281,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func pollLiveMetrics() {
-        guard statsController?.isLiveConsoleVisible == true, !isLivePolling else { return }
+        guard statsController?.window?.isVisible == true, !isLivePolling else { return }
         isLivePolling = true
+        let displayedRevision = latestStatsData?.revision
+        let displayedDay = latestStatsData?.dayStart
         storeQueue.async { [weak self] in
             guard let self else { return }
             _ = self.store.importCodexHistory()
-            let records = self.store.records
-            let apiCalls = self.store.apiCalls
-            let activeAPICalls = self.store.activeAPICalls
-            let titles = self.store.sessionTitles()
+            let currentDay = Calendar.current.startOfDay(for: Date())
+            let statsData = self.store.revision == displayedRevision && currentDay == displayedDay
+                ? nil : self.makeStatsSnapshot()
             DispatchQueue.main.async {
-                self.statsController?.update(records: records, apiCalls: apiCalls,
-                                             activeAPICalls: activeAPICalls, sessionTitles: titles)
+                if let statsData { self.applyStatsSnapshot(statsData) }
                 self.isLivePolling = false
             }
+        }
+    }
+
+    // Called only on storeQueue, where MetricStore is mutated.
+    private func makeStatsSnapshot() -> StatsDataSnapshot {
+        StatsDataSnapshot(revision: store.revision,
+                          dayStart: Calendar.current.startOfDay(for: Date()), records: store.records,
+                          liveRequests: store.liveRequests, apiCalls: store.apiCalls,
+                          activeAPICalls: store.activeAPICalls,
+                          compactionCount: store.apiCalls.reduce(0) { $0 + ($1.operation == "compaction" ? 1 : 0) },
+                          sessionTitles: store.sessionTitles())
+    }
+
+    private func applyStatsSnapshot(_ data: StatsDataSnapshot) {
+        if let current = latestStatsData {
+            guard data.revision >= current.revision else { return }
+            guard data.revision != current.revision || data.dayStart != current.dayStart
+                    || data.sessionTitles != current.sessionTitles else { return }
+        }
+        latestStatsData = data
+        if pendingShowStats {
+            showStats()
+            return
+        }
+        if statsController?.window?.isVisible == true {
+            statsController?.update(snapshot: data)
         }
     }
 
@@ -1279,28 +1329,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if popover.isShown {
             popover.performClose(nil)
         } else {
-            updateUI()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         }
     }
 
-    private func updateUI() {
-        statsController?.update(records: store.records, apiCalls: store.apiCalls,
-                                activeAPICalls: store.activeAPICalls, sessionTitles: store.sessionTitles())
+    private func todayPopoverMetrics() -> PopoverMetrics {
         let calendar = Calendar.current
+        let startOfToday = calendar.startOfDay(for: Date())
+        let startOfTomorrow = calendar.date(byAdding: .day, value: 1, to: startOfToday) ?? .distantFuture
+        let fractionalISO = ISO8601DateFormatter()
+        fractionalISO.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let plainISO = ISO8601DateFormatter()
+        func isToday(_ timestamp: String) -> Bool {
+            guard let date = fractionalISO.date(from: timestamp) ?? plainISO.date(from: timestamp) else { return false }
+            return date >= startOfToday && date < startOfTomorrow
+        }
         let todayRecords = store.records.filter { record in
-            guard let date = requestMetricDate(record.timestamp) else { return false }
-            return calendar.isDateInToday(date)
+            isToday(record.timestamp)
         }
         let todayCalls = todayRecords.reduce(0) { $0 + ($1.modelCalls ?? 0) }
         let todayTokens = todayRecords.reduce(0) { $0 + $1.usage.total }
         let todayAPICalls = store.apiCalls.filter { call in
-            guard let date = requestMetricDate(call.timestamp) else { return false }
-            return calendar.isDateInToday(date)
+            isToday(call.timestamp)
         }
-        popoverController.update(snapshot: snapshot, todayCalls: todayCalls, todayTokens: todayTokens,
-                                 todayCost: summedAPICost(todayAPICalls), refreshedAt: Date())
-        popoverController.updateTibo(tiboSnapshot)
+        return PopoverMetrics(todayCalls: todayCalls, todayTokens: todayTokens,
+                              todayCost: summedAPICost(todayAPICalls))
+    }
+
+    private func updateUI(metrics: PopoverMetrics, statsData: StatsDataSnapshot) {
+        popoverController.update(snapshot: snapshot, todayCalls: metrics.todayCalls, todayTokens: metrics.todayTokens,
+                                 todayCost: metrics.todayCost, refreshedAt: Date())
+        applyStatsSnapshot(statsData)
         if let used = snapshot?.secondaryUsed ?? snapshot?.primaryUsed {
             statusItem.button?.title = " \(max(0, 100 - used))%"
         } else {
@@ -1313,12 +1372,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showStats() {
+        guard let data = latestStatsData else {
+            pendingShowStats = true
+            return
+        }
+        pendingShowStats = false
         if statsController == nil {
-            statsController = StatsWindowController(records: store.records, apiCalls: store.apiCalls,
-                                                    activeAPICalls: store.activeAPICalls, sessionTitles: store.sessionTitles())
+            statsController = StatsWindowController(snapshot: data)
         } else {
-            statsController?.update(records: store.records, apiCalls: store.apiCalls,
-                                    activeAPICalls: store.activeAPICalls, sessionTitles: store.sessionTitles())
+            statsController?.update(snapshot: data)
         }
         statsController?.showOverview()
         statsController?.showWindow(nil)

@@ -5,6 +5,8 @@ private struct GroupStats {
     let model: String
     let effort: String
     let modelCalls: Int
+    let activeCalls: Int
+    let completedTurns: Int
     let input: Int
     let cached: Int
     let output: Int
@@ -25,7 +27,7 @@ private struct DailyPoint {
     let modelCalls: Int
 }
 
-private struct ConsoleRow {
+private struct ConsoleRow: Equatable {
     let id: String
     let status: String?
     let sessionName: String
@@ -69,13 +71,42 @@ private struct StatsDateBounds {
     let includesEnd: Bool
 }
 
+private struct OverviewData {
+    let models: [String]
+    let efforts: [String]
+    let groups: [GroupStats]
+    let chart: [DailyPoint]
+    let summary: [String]
+    let subtitle: String
+    let completedCalls: Int
+    let activeCalls: Int
+}
+
+private struct OverviewSignature: Equatable {
+    struct ActiveKey: Equatable {
+        let id: String
+        let model: String
+        let effort: String
+    }
+    let recordCount: Int
+    let callCount: Int
+    let dayStart: Date
+    let live: [LiveRequest]
+    let active: [ActiveKey]
+}
+
+private struct ModelEffortKey: Hashable {
+    let model: String
+    let effort: String
+}
+
 final class StatsWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSTabViewDelegate {
     private var allRecords: [RequestMetric] = []
+    private var liveRequests: [LiveRequest] = []
     private var apiCalls: [APICallMetric] = []
     private var activeAPICalls: [ActiveAPICall] = []
+    private var compactionCount = 0
     private var sessionTitles: [String: String] = [:]
-    private var filteredRecords: [RequestMetric] = []
-    private var filteredAPICalls: [APICallMetric] = []
     private var groupRows: [GroupStats] = []
     private var consoleRows: [ConsoleRow] = []
 
@@ -98,13 +129,21 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
     private var consolePage = 0
     private var customDateBounds: StatsDateBounds?
     private var lastAppliedRangeIndex = StatsDateRange.today.rawValue
-    private var overviewNeedsRefresh = false
+    private let overviewQueue = DispatchQueue(label: "com.codexpulse.stats-overview", qos: .userInitiated)
+    private var overviewGeneration = 0
+    private var overviewInFlight = false
+    private var overviewPending = false
+    private var readyOverview: OverviewData?
+    private var readyOverviewGeneration = -1
+    private var appliedOverviewGeneration = -1
+    private var lastOverviewSignature: OverviewSignature?
+    private var consoleNeedsRefresh = true
 
     var isLiveConsoleVisible: Bool {
         window?.isVisible == true && (tabs.selectedTabViewItem?.identifier as? String) == "console"
     }
 
-    init(records: [RequestMetric], apiCalls: [APICallMetric], activeAPICalls: [ActiveAPICall], sessionTitles: [String: String]) {
+    init(snapshot: StatsDataSnapshot) {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1180, height: 740),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -116,25 +155,31 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         window.isReleasedWhenClosed = false
         super.init(window: window)
         buildInterface()
-        update(records: records, apiCalls: apiCalls, activeAPICalls: activeAPICalls, sessionTitles: sessionTitles)
+        update(snapshot: snapshot)
         window.center()
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    func update(records: [RequestMetric], apiCalls: [APICallMetric], activeAPICalls: [ActiveAPICall], sessionTitles: [String: String]) {
-        allRecords = records
-        self.apiCalls = apiCalls
-        self.activeAPICalls = activeAPICalls
-        self.sessionTitles = sessionTitles
-        if (tabs.selectedTabViewItem?.identifier as? String) == "console" {
-            overviewNeedsRefresh = true
-            rebuildConsole()
-        } else {
-            rebuildFilterChoices()
-            applyFilters()
-            overviewNeedsRefresh = false
+    func update(snapshot: StatsDataSnapshot) {
+        allRecords = snapshot.records
+        liveRequests = snapshot.liveRequests
+        apiCalls = snapshot.apiCalls
+        activeAPICalls = snapshot.activeAPICalls
+        compactionCount = snapshot.compactionCount
+        sessionTitles = snapshot.sessionTitles
+        let signature = OverviewSignature(recordCount: allRecords.count, callCount: apiCalls.count,
+                                          dayStart: snapshot.dayStart,
+                                          live: liveRequests,
+                                          active: activeAPICalls.map {
+                                              OverviewSignature.ActiveKey(id: $0.id, model: $0.model, effort: $0.effort)
+                                          })
+        if signature != lastOverviewSignature {
+            lastOverviewSignature = signature
+            requestOverviewRefresh()
         }
+        consoleNeedsRefresh = true
+        if isLiveConsoleVisible { rebuildConsole() }
     }
 
     func showOverview() {
@@ -172,12 +217,20 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
 
     func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
         switch tabViewItem?.identifier as? String {
-        case "overview" where overviewNeedsRefresh:
-            rebuildFilterChoices()
-            applyFilters()
-            overviewNeedsRefresh = false
+        case "overview":
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in
+                guard let self, (self.tabs.selectedTabViewItem?.identifier as? String) == "overview",
+                      let ready = self.readyOverview,
+                      self.readyOverviewGeneration == self.overviewGeneration else { return }
+                self.applyOverview(ready, generation: self.readyOverviewGeneration)
+            }
         case "console":
-            rebuildConsole(animated: false)
+            // Let AppKit paint the selected tab before refreshing its table.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in
+                guard let self, self.consoleNeedsRefresh,
+                      (self.tabs.selectedTabViewItem?.identifier as? String) == "console" else { return }
+                self.rebuildConsole(animated: false)
+            }
         default:
             break
         }
@@ -416,6 +469,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
     private func configureConsoleTable() {
         consoleTable.delegate = self
         consoleTable.dataSource = self
+        consoleTable.columnAutoresizingStyle = .noColumnAutoresizing
         consoleTable.usesAlternatingRowBackgroundColors = false
         consoleTable.gridStyleMask = [.solidHorizontalGridLineMask]
         consoleTable.gridColor = NSColor.separatorColor.withAlphaComponent(0.22)
@@ -437,28 +491,39 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         }
     }
 
-    private func rebuildFilterChoices() {
+    private func rebuildFilterChoices(models: [String], efforts: [String]) {
+        let modelTitles = ["全部模型"] + models
+        let effortTitles = ["全部等级"] + efforts
+        guard modelPopup.itemTitles != modelTitles || effortPopup.itemTitles != effortTitles else { return }
         let previousModel = modelPopup.titleOfSelectedItem
         let previousEffort = effortPopup.titleOfSelectedItem
-        let models = Set(allRecords.map(\.model)).sorted()
-        let efforts = Set(allRecords.map(\.effort)).sorted()
-        modelPopup.removeAllItems()
-        modelPopup.addItem(withTitle: "全部模型")
-        modelPopup.addItems(withTitles: models)
-        if let previousModel, modelPopup.itemTitles.contains(previousModel) { modelPopup.selectItem(withTitle: previousModel) }
-        effortPopup.removeAllItems()
-        effortPopup.addItem(withTitle: "全部等级")
-        effortPopup.addItems(withTitles: efforts)
-        if let previousEffort, effortPopup.itemTitles.contains(previousEffort) { effortPopup.selectItem(withTitle: previousEffort) }
+        if modelPopup.itemTitles != modelTitles {
+            modelPopup.removeAllItems()
+            modelPopup.addItems(withTitles: modelTitles)
+            if let previousModel, modelPopup.itemTitles.contains(previousModel) {
+                modelPopup.selectItem(withTitle: previousModel)
+            }
+        }
+        if effortPopup.itemTitles != effortTitles {
+            effortPopup.removeAllItems()
+            effortPopup.addItems(withTitles: effortTitles)
+            if let previousEffort, effortPopup.itemTitles.contains(previousEffort) {
+                effortPopup.selectItem(withTitle: previousEffort)
+            }
+        }
+        if previousModel != nil && modelPopup.titleOfSelectedItem != previousModel
+            || previousEffort != nil && effortPopup.titleOfSelectedItem != previousEffort {
+            requestOverviewRefresh()
+        }
     }
 
-    @objc private func filterChanged() { applyFilters() }
+    @objc private func filterChanged() { requestOverviewRefresh() }
 
     @objc private func rangeChanged() {
         guard rangePopup.indexOfSelectedItem == StatsDateRange.custom.rawValue else {
             lastAppliedRangeIndex = rangePopup.indexOfSelectedItem
             rangePopup.toolTip = nil
-            applyFilters()
+            requestOverviewRefresh()
             return
         }
         presentCustomRangePicker()
@@ -508,7 +573,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         rangePopup.item(at: StatsDateRange.custom.rawValue)?.title = customRangeTitle(start: startPicker.dateValue, end: endPicker.dateValue)
         rangePopup.toolTip = "自选范围：\(fullDateTime(startPicker.dateValue)) 至 \(fullDateTime(endPicker.dateValue))"
         rangePopup.selectItem(at: StatsDateRange.custom.rawValue)
-        applyFilters()
+        requestOverviewRefresh()
     }
 
     private func dateTimePicker(_ date: Date) -> NSDatePicker {
@@ -562,18 +627,55 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         }
     }
 
-    private func timestamp(_ value: String, isWithin bounds: StatsDateBounds) -> Bool {
-        guard bounds.start != nil || bounds.end != nil else { return true }
-        guard let date = metricDate(value) else { return false }
-        if let start = bounds.start, date < start { return false }
-        if let end = bounds.end, bounds.includesEnd ? date > end : date >= end { return false }
-        return true
+    private func requestOverviewRefresh() {
+        overviewGeneration &+= 1
+        overviewPending = true
+        startOverviewRefreshIfNeeded()
     }
 
-    private func applyFilters() {
+    private func startOverviewRefreshIfNeeded() {
+        guard overviewPending, !overviewInFlight else { return }
+        overviewPending = false
+        overviewInFlight = true
+        let generation = overviewGeneration
+        let records = allRecords
+        let live = liveRequests
+        let calls = apiCalls
+        let active = activeAPICalls
         let model = modelPopup.titleOfSelectedItem ?? "全部模型"
         let effort = effortPopup.titleOfSelectedItem ?? "全部等级"
-        let dateBounds = selectedDateBounds()
+        let range = StatsDateRange(rawValue: rangePopup.indexOfSelectedItem) ?? .today
+        let bounds = selectedDateBounds()
+        overviewQueue.async { [weak self] in
+            let result = Self.buildOverview(records: records, live: live, calls: calls, active: active,
+                                            model: model, effort: effort, range: range, bounds: bounds)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.overviewInFlight = false
+                if generation == self.overviewGeneration {
+                    self.readyOverview = result
+                    self.readyOverviewGeneration = generation
+                    if (self.tabs.selectedTabViewItem?.identifier as? String) == "overview" {
+                        self.applyOverview(result, generation: generation)
+                    }
+                }
+                self.startOverviewRefreshIfNeeded()
+            }
+        }
+    }
+
+    private func applyOverview(_ result: OverviewData, generation: Int) {
+        guard appliedOverviewGeneration != generation else { return }
+        appliedOverviewGeneration = generation
+        rebuildFilterChoices(models: result.models, efforts: result.efforts)
+        groupRows = result.groups
+        for (label, value) in zip(summaryValues, result.summary) { label.stringValue = value }
+        summaryValues.first?.toolTip = "\(result.completedCalls) 次已完成 · \(result.activeCalls) 次进行中"
+        summaryValues.dropFirst().first?.toolTip = "包含进行中会话已上报的 Token；尚未上报的用量不作推测"
+        summaryValues[2].toolTip = "只估算已完成且有完整用量的 API 调用；进行中的调用尚无最终价格"
+        subtitleLabel.stringValue = result.subtitle
+        chartView.points = result.chart
+        tableView.reloadData()
         switch StatsDateRange(rawValue: rangePopup.indexOfSelectedItem) ?? .today {
         case .today:
             chartTitleLabel.stringValue = "今日 Token"
@@ -591,35 +693,17 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
             chartTitleLabel.stringValue = "每日 Token 趋势"
             chartHeightConstraint?.constant = 128
         }
-        filteredRecords = allRecords.filter { record in
-            if model != "全部模型" && record.model != model { return false }
-            if effort != "全部等级" && record.effort != effort { return false }
-            return timestamp(record.timestamp, isWithin: dateBounds)
-        }
-        filteredAPICalls = apiCalls.filter { call in
-            if model != "全部模型" && call.model != model { return false }
-            if effort != "全部等级" && call.effort != effort { return false }
-            return timestamp(call.timestamp, isWithin: dateBounds)
-        }
-        groupRows = grouped(filteredRecords, apiCalls: filteredAPICalls)
-        updateSummary()
-        chartView.points = dailyPoints(filteredRecords)
-        tableView.reloadData()
-        let modelCalls = filteredRecords.reduce(0) { $0 + ($1.modelCalls ?? 0) }
-        let compactions = filteredAPICalls.filter { $0.operation == "compaction" }.count
-        let compactionSuffix = compactions > 0 ? " · \(compactNumber(compactions)) 次压缩" : ""
-        subtitleLabel.stringValue = "\(compactNumber(filteredRecords.count)) 个任务 · \(compactNumber(modelCalls)) 次 API 请求\(compactionSuffix)"
     }
 
     private func rebuildConsole(animated: Bool = true) {
+        consoleNeedsRefresh = false
         let totalCount = apiCalls.count + activeAPICalls.count
         let pageCount = max(1, Int(ceil(Double(totalCount) / Double(consolePageSize))))
         consolePage = min(consolePage, pageCount - 1)
         let newRows = consoleRowsForCurrentPage()
         applyConsoleRows(newRows, animated: animated && consolePage == 0)
         let activeSuffix = activeAPICalls.isEmpty ? "" : " · \(activeAPICalls.count) 进行中"
-        let compactions = apiCalls.filter { $0.operation == "compaction" }.count
-        let compactionSuffix = compactions > 0 ? " · \(fullNumber(compactions)) 次压缩" : ""
+        let compactionSuffix = compactionCount > 0 ? " · \(fullNumber(compactionCount)) 次压缩" : ""
         consoleStatusLabel.stringValue = "\(fullNumber(apiCalls.count)) 次 API 请求\(activeSuffix)\(compactionSuffix)"
         consolePageLabel.stringValue = "\(consolePage + 1) / \(pageCount)"
         previousPageButton.isEnabled = consolePage > 0
@@ -690,17 +774,11 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         for row in oldRows { oldByID[row.id] = row }
         let contentChanges = IndexSet(newRows.indices.filter {
             guard let old = oldByID[newRows[$0].id] else { return false }
-            let new = newRows[$0]
-            return old.status != new.status || old.model != new.model
-                || old.responseModel != new.responseModel || old.effort != new.effort
-                || old.serviceTier != new.serviceTier || old.ttftMS != new.ttftMS
-                || old.durationMS != new.durationMS || old.tokenRate != new.tokenRate
-                || old.operation != new.operation || old.sessionName != new.sessionName
-                || old.usage?.input != new.usage?.input
-                || old.usage?.cached != new.usage?.cached
-                || old.usage?.output != new.usage?.output
-                || old.usage?.reasoning != new.usage?.reasoning
-                || old.usage?.total != new.usage?.total
+            return old != newRows[$0]
+        })
+        let heightChanges = IndexSet(newRows.indices.filter {
+            guard let old = oldByID[newRows[$0].id] else { return false }
+            return old.hasModelMismatch != newRows[$0].hasModelMismatch
         })
         consoleRows = newRows
         if !removals.isEmpty || !insertions.isEmpty {
@@ -709,8 +787,10 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
             consoleTable.insertRows(at: insertions, withAnimation: [.slideDown, .effectFade])
             consoleTable.endUpdates()
         }
+        if !heightChanges.isEmpty {
+            consoleTable.noteHeightOfRows(withIndexesChanged: heightChanges)
+        }
         if !contentChanges.isEmpty {
-            consoleTable.noteHeightOfRows(withIndexesChanged: contentChanges)
             consoleTable.reloadData(forRowIndexes: contentChanges,
                                     columnIndexes: IndexSet(integersIn: 0..<consoleTable.numberOfColumns))
         }
@@ -729,60 +809,136 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         rebuildConsole(animated: false)
     }
 
-    private func grouped(_ records: [RequestMetric], apiCalls: [APICallMetric]) -> [GroupStats] {
-        let callsByGroup = Dictionary(grouping: apiCalls) { "\($0.model)\u{1f}\($0.effort)" }
-        return Dictionary(grouping: records) { "\($0.model)\u{1f}\($0.effort)" }.map { key, bucket in
-            let first = bucket[0]
-            let durations = bucket.map(\.durationMS)
-            let ttfts = bucket.map(\.ttftMS).filter { $0 > 0 }
+    // Pure aggregation runs on overviewQueue; only the small result is applied on the main thread.
+    private static func buildOverview(records: [RequestMetric], live: [LiveRequest],
+                                      calls: [APICallMetric], active: [ActiveAPICall],
+                                      model: String, effort: String, range: StatsDateRange,
+                                      bounds: StatsDateBounds) -> OverviewData {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let plain = ISO8601DateFormatter()
+        let utc = ISO8601DateFormatter()
+        let startKey = bounds.start.map { String(utc.string(from: $0).prefix(19)) }
+        let endKey = bounds.end.map { String(utc.string(from: $0).prefix(19)) }
+        func parseDate(_ value: String) -> Date? { fractional.date(from: value) ?? plain.date(from: value) }
+        func matches(_ candidateModel: String, _ candidateEffort: String, _ timestamp: String) -> Bool {
+            if model != "全部模型" && candidateModel != model { return false }
+            if effort != "全部等级" && candidateEffort != effort { return false }
+            guard bounds.start != nil || bounds.end != nil else { return true }
+            // Codex emits UTC ISO timestamps. Reject most out-of-range history by
+            // sortable second before invoking the comparatively expensive parser.
+            if timestamp.hasSuffix("Z"), timestamp.count >= 20 {
+                let key = String(timestamp.prefix(19))
+                if let startKey, key < startKey { return false }
+                if let endKey, key > endKey { return false }
+                if key != startKey && key != endKey { return true }
+            }
+            guard let date = parseDate(timestamp) else { return false }
+            if let start = bounds.start, date < start { return false }
+            if let end = bounds.end, bounds.includesEnd ? date > end : date >= end { return false }
+            return true
+        }
+        let models = Set(records.map(\.model) + live.map(\.model) + calls.map(\.model) + active.map(\.model)).sorted()
+        let efforts = Set(records.map(\.effort) + live.map(\.effort) + calls.map(\.effort) + active.map(\.effort)).sorted()
+        let filteredRecords = records.filter { matches($0.model, $0.effort, $0.timestamp) }
+        let filteredLive = live.filter { matches($0.model, $0.effort, $0.timestamp) }
+        let filteredCalls = calls.filter { matches($0.model, $0.effort, $0.timestamp) }
+        let filteredActive = active.filter { matches($0.model, $0.effort, $0.timestamp) }
+        let groups = grouped(records: filteredRecords, live: filteredLive,
+                             calls: filteredCalls, active: filteredActive)
+
+        let usage = (filteredRecords.map(\.usage) + filteredLive.map(\.usage)).reduce(into: TokenUsage()) { sum, item in
+            sum.input += item.input
+            sum.cached += item.cached
+            sum.output += item.output
+            sum.reasoning += item.reasoning
+            sum.total += item.total
+        }
+        let ttfts = filteredRecords.map(\.ttftMS).filter { $0 > 0 }
+        let durations = filteredRecords.map(\.durationMS)
+        let completedCalls = filteredRecords.reduce(0) { $0 + ($1.modelCalls ?? 0) }
+            + filteredLive.reduce(0) { $0 + $1.modelCalls }
+        let activeCalls = filteredActive.count
+        let compactions = filteredCalls.reduce(0) { $0 + ($1.operation == "compaction" ? 1 : 0) }
+        let cost = summedAPICost(filteredCalls)
+        let costLabel = filteredCalls.isEmpty && activeCalls > 0 ? "待完成" : formatAPICost(cost)
+        let activeSuffix = filteredLive.isEmpty ? "" : "（\(compactNumber(filteredLive.count)) 进行中）"
+        let callSuffix = activeCalls == 0 ? "" : " · \(compactNumber(activeCalls)) 进行中"
+        let compactionSuffix = compactions == 0 ? "" : " · \(compactNumber(compactions)) 次压缩"
+        return OverviewData(
+            models: models, efforts: efforts, groups: groups,
+            chart: dailyPoints(records: filteredRecords, live: filteredLive, active: filteredActive,
+                               range: range, bounds: bounds, parseDate: parseDate),
+            summary: [compactNumber(completedCalls + activeCalls), compactNumber(usage.total),
+                      costLabel,
+                      ttfts.isEmpty ? "--" : formatDuration(percentile(ttfts, 0.50)),
+                      durations.isEmpty ? "--" : formatDuration(percentile(durations, 0.95)),
+                      formatTokenRate(aggregateTokenRate(filteredCalls)),
+                      percent(usage.input > 0 ? Double(usage.cached) / Double(usage.input) : 0),
+                      percent(usage.output > 0 ? Double(usage.reasoning) / Double(usage.output) : 0)],
+            subtitle: "\(compactNumber(filteredRecords.count + filteredLive.count)) 个任务\(activeSuffix) · \(compactNumber(completedCalls)) 次已完成 API 请求\(callSuffix)\(compactionSuffix)",
+            completedCalls: completedCalls, activeCalls: activeCalls
+        )
+    }
+
+    private static func grouped(records: [RequestMetric], live: [LiveRequest],
+                                calls: [APICallMetric], active: [ActiveAPICall]) -> [GroupStats] {
+        let recordsByGroup = Dictionary(grouping: records) { ModelEffortKey(model: $0.model, effort: $0.effort) }
+        let liveByGroup = Dictionary(grouping: live) { ModelEffortKey(model: $0.model, effort: $0.effort) }
+        let callsByGroup = Dictionary(grouping: calls) { ModelEffortKey(model: $0.model, effort: $0.effort) }
+        let activeByGroup = Dictionary(grouping: active) { ModelEffortKey(model: $0.model, effort: $0.effort) }
+        let keys = Set(recordsByGroup.keys).union(liveByGroup.keys).union(callsByGroup.keys).union(activeByGroup.keys)
+        return keys.map { groupKey in
+            let finished = recordsByGroup[groupKey] ?? []
+            let ongoing = liveByGroup[groupKey] ?? []
+            let completedAPI = callsByGroup[groupKey] ?? []
+            let activeAPI = activeByGroup[groupKey] ?? []
+            let usage = (finished.map(\.usage) + ongoing.map(\.usage)).reduce(into: TokenUsage()) { sum, item in
+                sum.input += item.input
+                sum.cached += item.cached
+                sum.output += item.output
+                sum.reasoning += item.reasoning
+                sum.total += item.total
+            }
+            let durations = finished.map(\.durationMS)
+            let ttfts = finished.map(\.ttftMS).filter { $0 > 0 }
             return GroupStats(
-                model: first.model, effort: first.effort,
-                modelCalls: bucket.reduce(0) { $0 + ($1.modelCalls ?? 0) },
-                input: bucket.reduce(0) { $0 + $1.usage.input },
-                cached: bucket.reduce(0) { $0 + $1.usage.cached },
-                output: bucket.reduce(0) { $0 + $1.usage.output },
-                reasoning: bucket.reduce(0) { $0 + $1.usage.reasoning },
-                total: bucket.reduce(0) { $0 + $1.usage.total },
-                cost: summedAPICost(callsByGroup[key] ?? []),
+                model: groupKey.model, effort: groupKey.effort,
+                modelCalls: finished.reduce(0) { $0 + ($1.modelCalls ?? 0) }
+                    + ongoing.reduce(0) { $0 + $1.modelCalls } + activeAPI.count,
+                activeCalls: activeAPI.count,
+                completedTurns: finished.count,
+                input: usage.input, cached: usage.cached, output: usage.output,
+                reasoning: usage.reasoning, total: usage.total,
+                cost: summedAPICost(completedAPI),
                 typicalTTFT: percentile(ttfts, 0.50), slowerTTFT: percentile(ttfts, 0.95),
                 averageDuration: durations.isEmpty ? 0 : durations.reduce(0, +) / durations.count,
-                tokenRate: aggregateTokenRate(callsByGroup[key] ?? [])
+                tokenRate: aggregateTokenRate(completedAPI)
             )
         }.sorted { $0.total > $1.total }
     }
 
-    private func updateSummary() {
-        let total = filteredRecords.reduce(0) { $0 + $1.usage.total }
-        let input = filteredRecords.reduce(0) { $0 + $1.usage.input }
-        let cached = filteredRecords.reduce(0) { $0 + $1.usage.cached }
-        let output = filteredRecords.reduce(0) { $0 + $1.usage.output }
-        let reasoning = filteredRecords.reduce(0) { $0 + $1.usage.reasoning }
-        let ttfts = filteredRecords.map(\.ttftMS).filter { $0 > 0 }
-        let durations = filteredRecords.map(\.durationMS)
-        let cost = summedAPICost(filteredAPICalls)
-        let modelCalls = filteredRecords.reduce(0) { $0 + ($1.modelCalls ?? 0) }
-        let values = [compactNumber(modelCalls), compactNumber(total),
-                      formatAPICost(cost),
-                      formatDuration(percentile(ttfts, 0.50)), formatDuration(percentile(durations, 0.95)),
-                      formatTokenRate(aggregateTokenRate(filteredAPICalls)),
-                      percent(input > 0 ? Double(cached) / Double(input) : 0),
-                      percent(output > 0 ? Double(reasoning) / Double(output) : 0)]
-        for (label, value) in zip(summaryValues, values) { label.stringValue = value }
-    }
-
-    private func dailyPoints(_ records: [RequestMetric]) -> [DailyPoint] {
+    private static func dailyPoints(records: [RequestMetric], live: [LiveRequest],
+                                    active: [ActiveAPICall], range: StatsDateRange,
+                                    bounds: StatsDateBounds, parseDate: (String) -> Date?) -> [DailyPoint] {
         let calendar = Calendar.current
-        let dated = records.compactMap { record -> (Date, RequestMetric)? in
-            metricDate(record.timestamp).map { (calendar.startOfDay(for: $0), record) }
+        var byDay: [Date: (tokens: Int, modelCalls: Int)] = [:]
+        func add(_ timestamp: String, tokens: Int, calls: Int) {
+            guard let date = parseDate(timestamp) else { return }
+            let day = calendar.startOfDay(for: date)
+            var totals = byDay[day] ?? (tokens: 0, modelCalls: 0)
+            totals.tokens += tokens
+            totals.modelCalls += calls
+            byDay[day] = totals
         }
-        let grouped = Dictionary(grouping: dated, by: { $0.0 })
-        let selection = StatsDateRange(rawValue: rangePopup.indexOfSelectedItem) ?? .today
-        let bounds = selectedDateBounds()
+        for record in records { add(record.timestamp, tokens: record.usage.total, calls: record.modelCalls ?? 0) }
+        for request in live { add(request.timestamp, tokens: request.usage.total, calls: request.modelCalls) }
+        for call in active { add(call.timestamp, tokens: 0, calls: 1) }
         let earliest: Date
         let latest: Date
-        if selection == .allTime {
-            guard let latestRecordDay = dated.map(\.0).max() else { return [] }
-            latest = latestRecordDay
+        if range == .allTime {
+            guard let latestDay = byDay.keys.max() else { return [] }
+            latest = latestDay
             earliest = calendar.date(byAdding: .day, value: -29, to: latest) ?? latest
         } else {
             guard let start = bounds.start, let end = bounds.end else { return [] }
@@ -793,13 +949,69 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         var points: [DailyPoint] = []
         var date = earliest
         while date <= latest {
-            let rows = grouped[date] ?? []
-            points.append(DailyPoint(date: date, tokens: rows.reduce(0) { $0 + $1.1.usage.total },
-                                     modelCalls: rows.reduce(0) { $0 + ($1.1.modelCalls ?? 0) }))
+            let totals = byDay[date] ?? (tokens: 0, modelCalls: 0)
+            points.append(DailyPoint(date: date, tokens: totals.tokens, modelCalls: totals.modelCalls))
             date = calendar.date(byAdding: .day, value: 1, to: date) ?? latest.addingTimeInterval(1)
         }
         return points
     }
+
+#if PRICING_TESTS
+    static func runOverviewRegressionTests() {
+        let timestamp = "2026-09-23T08:00:00Z"
+        let finishedUsage = TokenUsage(input: 100, cached: 20, output: 10, reasoning: 4, total: 110)
+        let liveUsage = TokenUsage(input: 40, cached: 20, output: 10, reasoning: 2, total: 50)
+        let finished = RequestMetric(turnID: "finished", timestamp: timestamp, model: "gpt-6-sol",
+                                     effort: "high", ttftMS: 500, durationMS: 2_000,
+                                     usage: finishedUsage, modelCalls: 1, source: "test")
+        let live = LiveRequest(turnID: "live", timestamp: timestamp, model: "gpt-6-sol",
+                               effort: "high", usage: liveUsage, modelCalls: 1, source: "test")
+        let completedAPI = APICallMetric(id: "finished-api", sessionID: "session", turnID: "finished",
+                                         timestamp: timestamp, model: "gpt-6-sol", responseModel: nil,
+                                         effort: "high", serviceTier: "default", ttftMS: 500,
+                                         ttftEstimated: false, durationMS: 2_000, durationEstimated: false,
+                                         operation: nil, usage: finishedUsage, source: "test")
+        let activeAPI = ActiveAPICall(id: "active-api", sessionID: "session", turnID: "live",
+                                      timestamp: timestamp, model: "gpt-6-sol", responseModel: nil,
+                                      effort: "high", serviceTier: "default", ttftMS: nil,
+                                      ttftEstimated: nil, durationMS: nil, durationEstimated: nil,
+                                      status: "请求中", source: "test")
+        let bounds = StatsDateBounds(start: nil, end: nil, includesEnd: false)
+        let running = buildOverview(records: [finished], live: [live], calls: [completedAPI],
+                                    active: [activeAPI], model: "全部模型", effort: "全部等级",
+                                    range: .allTime, bounds: bounds)
+        precondition(running.completedCalls == 2 && running.activeCalls == 1)
+        precondition(running.groups.count == 1 && running.groups[0].total == 160)
+        precondition(running.groups[0].modelCalls == 3 && running.groups[0].activeCalls == 1)
+        precondition(running.chart.reduce(0) { $0 + $1.tokens } == 160)
+        let newlyFinished = RequestMetric(turnID: "live", timestamp: timestamp, model: "gpt-6-sol",
+                                          effort: "high", ttftMS: 300, durationMS: 1_000,
+                                          usage: liveUsage, modelCalls: 1, source: "test")
+        let settled = buildOverview(records: [finished, newlyFinished], live: [], calls: [completedAPI],
+                                    active: [], model: "全部模型", effort: "全部等级",
+                                    range: .allTime, bounds: bounds)
+        precondition(settled.completedCalls == 2 && settled.activeCalls == 0)
+        precondition(settled.groups[0].total == 160 && settled.groups[0].modelCalls == 2)
+
+        let instant = ISO8601DateFormatter().date(from: timestamp)!
+        let exactBounds = StatsDateBounds(start: instant, end: instant, includesEnd: true)
+        let laterLive = LiveRequest(turnID: "later", timestamp: "2026-09-23T08:00:00.500Z",
+                                    model: "gpt-6-sol", effort: "high", usage: liveUsage,
+                                    modelCalls: 1, source: "test")
+        let exact = buildOverview(records: [finished], live: [laterLive], calls: [], active: [],
+                                  model: "全部模型", effort: "全部等级", range: .custom, bounds: exactBounds)
+        precondition(exact.groups.count == 1 && exact.groups[0].total == 110,
+                     "Inclusive second boundary must exclude later fractional timestamps")
+
+        let manyCalls = Array(repeating: completedAPI, count: 25_000)
+        let started = CFAbsoluteTimeGetCurrent()
+        let large = buildOverview(records: [finished], live: [live], calls: manyCalls,
+                                  active: [activeAPI], model: "全部模型", effort: "全部等级",
+                                  range: .allTime, bounds: bounds)
+        precondition(large.groups.count == 1 && large.activeCalls == 1)
+        print(String(format: "25k-call overview aggregation: %.3fs", CFAbsoluteTimeGetCurrent() - started))
+    }
+#endif
 
     func numberOfRows(in tableView: NSTableView) -> Int {
         tableView === consoleTable ? consoleRows.count : groupRows.count
@@ -823,28 +1035,32 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         let cell = reusableCell(in: tableView, id: id)
         let value: String
         switch id.rawValue {
-        case "group": value = "\(stats.model) · \(stats.effort)"
+        case "group": value = "\(stats.model) · \(stats.effort)" + (stats.activeCalls > 0 ? " · \(stats.activeCalls) 进行中" : "")
         case "count": value = compactNumber(stats.modelCalls)
         case "total": value = compactNumber(stats.total)
-        case "value": value = formatAPICost(stats.cost)
+        case "value": value = stats.cost.pricedCalls + stats.cost.unpricedCalls == 0 && stats.activeCalls > 0
+            ? "待完成" : formatAPICost(stats.cost)
         case "input": value = compactNumber(stats.input)
         case "output": value = compactNumber(stats.output)
         case "reasoning": value = compactNumber(stats.reasoning)
         case "rate": value = formatTokenRate(stats.tokenRate)
-        case "typical": value = formatDuration(stats.typicalTTFT)
-        case "slower": value = formatDuration(stats.slowerTTFT)
-        case "duration": value = formatDuration(stats.averageDuration)
+        case "typical": value = stats.completedTurns == 0 || stats.typicalTTFT == 0 ? "--" : formatDuration(stats.typicalTTFT)
+        case "slower": value = stats.completedTurns == 0 || stats.slowerTTFT == 0 ? "--" : formatDuration(stats.slowerTTFT)
+        case "duration": value = stats.completedTurns == 0 ? "--" : formatDuration(stats.averageDuration)
         case "cache": value = percent(stats.cacheRate)
         default: value = ""
         }
         cell.textField?.stringValue = value
         cell.textField?.alignment = .left
         switch id.rawValue {
+        case "group": cell.toolTip = value
+        case "count": cell.toolTip = "\(stats.modelCalls - stats.activeCalls) 次已完成 · \(stats.activeCalls) 次进行中"
         case "total": cell.toolTip = fullNumber(stats.total) + " Token"
         case "input": cell.toolTip = fullNumber(stats.input) + " Token"
         case "output": cell.toolTip = fullNumber(stats.output) + " Token"
         case "reasoning": cell.toolTip = fullNumber(stats.reasoning) + " Token"
-        case "value": cell.toolTip = costSummaryTooltip(stats.cost)
+        case "value": cell.toolTip = value == "待完成"
+            ? "进行中调用尚无最终用量，完成后才能估算价值" : costSummaryTooltip(stats.cost)
         case "rate": cell.toolTip = "该模型已完成调用的输出 Token ÷ 出字阶段总耗时；缺少可信时序的调用不参与计算"
         default: cell.toolTip = nil
         }
