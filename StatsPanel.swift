@@ -1618,6 +1618,9 @@ private func apiPrice(for rawModel: String, serviceTier: String?, inputTokens: I
     if matchesModel(model, "gpt-6-astra") {
         return latest("GPT-6 Astra", 10, 1, 50)
     }
+    if matchesModel(model, "gpt-6.1-sol") {
+        return latest("GPT-6.1 Sol", 2, 0.1, 10)
+    }
     if matchesModel(model, "gpt-6-sol") {
         return latest("GPT-6 Sol", 2, 0.2, 10)
     }
@@ -1752,11 +1755,20 @@ func runPricingRegressionTests() {
     }
     let short = TokenUsage(input: 200_000, cached: 100_000, output: 10_000,
                            reasoning: 0, total: 210_000)
+    approx(estimatedAPICost(model: "gpt-6.1-sol", serviceTier: "default", usage: short), 0.31)
+    approx(estimatedAPICost(model: "gpt-6.1-sol", serviceTier: "fast", usage: short), 0.62)
+    approx(estimatedAPICost(model: "gpt-6.1-sol-2026-09-30", serviceTier: "priority", usage: short), 0.62)
     approx(estimatedAPICost(model: "gpt-6-sol", serviceTier: "default", usage: short), 0.32)
     approx(estimatedAPICost(model: "gpt-6-sol", serviceTier: "fast", usage: short), 0.64)
     approx(estimatedAPICost(model: "gpt-6-luna", serviceTier: "default", usage: short), 0.016)
     let long = TokenUsage(input: 300_000, cached: 100_000, output: 10_000,
                           reasoning: 0, total: 310_000)
+    approx(estimatedAPICost(model: "gpt-6.1-sol", serviceTier: "default", usage: long), 0.97)
+    approx(estimatedAPICost(model: "gpt-6.1-sol", serviceTier: "priority", usage: long), 1.94)
+    let boundary = TokenUsage(input: 272_000, cached: 100_000, output: 10_000,
+                              reasoning: 0, total: 282_000)
+    approx(estimatedAPICost(model: "gpt-6.1-sol", serviceTier: "standard", usage: boundary), 0.454)
+    assert(estimatedAPICost(model: "gpt-6.1-sol", serviceTier: "ultrafast", usage: short) == nil)
     approx(estimatedAPICost(model: "gpt-6-sol", serviceTier: "default", usage: long), 0.99)
     approx(estimatedAPICost(model: "gpt-5.6-sol", serviceTier: "priority", usage: long), 3.96)
     assert(estimatedAPICost(model: "gpt-5.6-sol", serviceTier: "ultrafast", usage: short) == nil)
@@ -1767,6 +1779,11 @@ func runPricingRegressionTests() {
                       ttftMS: ttft, ttftEstimated: true, durationMS: duration,
                       durationEstimated: true, operation: nil, usage: usage, source: "test")
     }
+    let sol61Summary = summedAPICost([call("gpt-6.1-sol", "default", short),
+                                     call("gpt-6.1-sol", "fast", long)])
+    approx(sol61Summary.knownUSD, 2.25)
+    assert(sol61Summary.pricedCalls == 2 && sol61Summary.unpricedCalls == 0)
+    assert(formatAPICost(sol61Summary) == "≈ $2.25")
     let summary = summedAPICost([call("gpt-6-sol", "default", short),
                                  call("gpt-5.6-sol", "ultrafast", short)])
     approx(summary.knownUSD, 0.32)
