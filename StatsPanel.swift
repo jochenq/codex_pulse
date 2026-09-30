@@ -1218,6 +1218,7 @@ private final class ConsoleModelCellView: NSTableCellView {
     private let requestedLabel = NSTextField(labelWithString: "")
     private let effortLabel = NSTextField(labelWithString: "")
     private let tierIcon = NSImageView()
+    private let tierLabel = NSTextField(labelWithString: "")
     private let responseLabel = NSTextField(labelWithString: "")
     private let mismatchBadge = MismatchBadgeView()
     private let metadataRow: NSStackView
@@ -1225,7 +1226,7 @@ private final class ConsoleModelCellView: NSTableCellView {
     private let contentStack: NSStackView
 
     override init(frame frameRect: NSRect) {
-        metadataRow = NSStackView(views: [effortLabel, tierIcon])
+        metadataRow = NSStackView(views: [effortLabel, tierIcon, tierLabel])
         responseRow = NSStackView(views: [responseLabel, mismatchBadge])
         contentStack = NSStackView(views: [requestedLabel, metadataRow, responseRow])
         super.init(frame: frameRect)
@@ -1240,6 +1241,9 @@ private final class ConsoleModelCellView: NSTableCellView {
         tierIcon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
         tierIcon.contentTintColor = .systemYellow
         tierIcon.setContentHuggingPriority(.required, for: .horizontal)
+        tierLabel.font = .systemFont(ofSize: 10, weight: .semibold)
+        tierLabel.textColor = .systemYellow
+        tierLabel.setContentHuggingPriority(.required, for: .horizontal)
         metadataRow.orientation = .horizontal
         metadataRow.alignment = .centerY
         metadataRow.spacing = 5
@@ -1276,6 +1280,8 @@ private final class ConsoleModelCellView: NSTableCellView {
             : ["priority", "fast"].contains(tier ?? "") ? "bolt.fill" : nil
         tierIcon.image = symbol.flatMap { NSImage(systemSymbolName: $0, accessibilityDescription: fastTierLabel(serviceTier)) }
         tierIcon.isHidden = tierIcon.image == nil
+        tierLabel.stringValue = fastTierLabel(serviceTier)
+        tierLabel.isHidden = tierIcon.isHidden
         let tierDescription = serviceTier.map { fastTierLabel($0) } ?? "档位未知"
         guard let responseModel,
               normalizedModelName(requestedModel) != normalizedModelName(responseModel) else {

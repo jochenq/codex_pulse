@@ -40,7 +40,7 @@ struct APICallMetric: Codable {
     let model: String
     let responseModel: String?
     let effort: String
-    let serviceTier: String?
+    var serviceTier: String?
     var ttftMS: Int?
     var ttftEstimated: Bool?
     let durationMS: Int?
@@ -58,7 +58,7 @@ struct ActiveAPICall {
     let model: String
     let responseModel: String?
     let effort: String
-    let serviceTier: String?
+    var serviceTier: String?
     let ttftMS: Int?
     let ttftEstimated: Bool?
     let durationMS: Int?
@@ -127,6 +127,94 @@ private struct ParseCheckpoint {
     var latestTimestamp: String
 }
 
+// Newer Codex builds omit service_tier from rollout JSONL. Runtime feedback
+// tags retain the actual request configuration, keyed by thread and turn.
+final class RuntimeServiceTiers {
+    private struct Observation {
+        let timestamp: TimeInterval
+        let tier: String
+    }
+    private let databaseURLs: [URL]
+    private var cursors: [String: Int64] = [:]
+    private var observations: [String: [Observation]] = [:]
+    private let turnPattern = try! NSRegularExpression(pattern: #"(?:^|[ {])turn_id[=:]"?([^" ,}]+)"#)
+    private let dateParser = ISO8601DateFormatter()
+
+    init(databaseURLs: [URL]) {
+        self.databaseURLs = databaseURLs
+        dateParser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    }
+
+    @discardableResult
+    func refresh() -> Bool {
+        var changed = false
+        for url in databaseURLs where FileManager.default.fileExists(atPath: url.path) {
+            var database: OpaquePointer?
+            guard sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
+                  let database else {
+                if let database { sqlite3_close(database) }
+                continue
+            }
+            defer { sqlite3_close(database) }
+            sqlite3_busy_timeout(database, 50)
+            var maximum: OpaquePointer?
+            guard sqlite3_prepare_v2(database, "SELECT MAX(id) FROM logs", -1, &maximum, nil) == SQLITE_OK else { continue }
+            let maxID = sqlite3_step(maximum) == SQLITE_ROW ? sqlite3_column_int64(maximum, 0) : 0
+            sqlite3_finalize(maximum)
+            let cursor = cursors[url.path] ?? 0
+            guard maxID > cursor else { continue }
+            var statement: OpaquePointer?
+            let query = "SELECT ts, ts_nanos, thread_id, feedback_log_body FROM logs WHERE id > ? AND id <= ? AND target = 'feedback_tags' AND feedback_log_body LIKE '%tags_json=%' ORDER BY id"
+            guard sqlite3_prepare_v2(database, query, -1, &statement, nil) == SQLITE_OK else { continue }
+            defer { sqlite3_finalize(statement) }
+            sqlite3_bind_int64(statement, 1, cursor)
+            sqlite3_bind_int64(statement, 2, maxID)
+            var step = sqlite3_step(statement)
+            while step == SQLITE_ROW {
+                if let threadText = sqlite3_column_text(statement, 2),
+                   let bodyText = sqlite3_column_text(statement, 3) {
+                    let thread = String(cString: threadText)
+                    let body = String(cString: bodyText)
+                    if let marker = body.range(of: "tags_json="),
+                       let data = String(body[marker.upperBound...]).data(using: .utf8),
+                       let tags = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let tier = tags["service_tier"] as? String,
+                       ["default", "standard", "priority", "fast", "ultrafast"].contains(tier),
+                       let match = turnPattern.firstMatch(in: body, range: NSRange(body.startIndex..., in: body)),
+                       let range = Range(match.range(at: 1), in: body) {
+                        let key = thread + ":" + body[range]
+                        let timestamp = Double(sqlite3_column_int64(statement, 0))
+                            + Double(sqlite3_column_int64(statement, 1)) / 1_000_000_000
+                        var values = observations[key] ?? []
+                        if values.last?.tier != tier || timestamp < (values.last?.timestamp ?? 0) {
+                            values.append(Observation(timestamp: timestamp, tier: tier))
+                            values.sort { $0.timestamp < $1.timestamp }
+                            observations[key] = values
+                            changed = true
+                        }
+                    }
+                }
+                step = sqlite3_step(statement)
+            }
+            if step == SQLITE_DONE { cursors[url.path] = maxID }
+        }
+        return changed
+    }
+
+    func tier(sessionID: String, turnID: String, timestamp: String) -> String? {
+        guard let date = dateParser.date(from: timestamp),
+              let values = observations[sessionID + ":" + turnID] else { return nil }
+        let time = date.timeIntervalSince1970
+        var lower = 0
+        var upper = values.count
+        while lower < upper {
+            let middle = (lower + upper) / 2
+            if values[middle].timestamp <= time { lower = middle + 1 } else { upper = middle }
+        }
+        return lower > 0 ? values[lower - 1].tier : nil
+    }
+}
+
 final class MetricStore {
     private(set) var records: [RequestMetric] = []
     private(set) var apiCalls: [APICallMetric] = []
@@ -141,6 +229,7 @@ final class MetricStore {
     private var activeAPIBySource: [String: ActiveAPICall] = [:]
     private var cachedSessionTitles: [String: String] = [:]
     private var titleDatabaseModificationDate: Date?
+    private let runtimeServiceTiers: RuntimeServiceTiers
     private let usageMigrationKey = "turn-token-usage-delta-v1"
     private let modelCallMigrationKey = "turn-model-call-count-v1"
     private let apiCallMigrationKey = "api-call-records-v1"
@@ -179,7 +268,12 @@ final class MetricStore {
     let apiCallsURL: URL
     private let scanStateURL: URL
 
-    init(directoryURL customDirectoryURL: URL? = nil) {
+    init(directoryURL customDirectoryURL: URL? = nil, logDatabaseURLs: [URL]? = nil) {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        runtimeServiceTiers = RuntimeServiceTiers(databaseURLs: logDatabaseURLs ?? [
+            home.appendingPathComponent(".codex/logs_2.sqlite"),
+            home.appendingPathComponent(".codex/sqlite/logs_2.sqlite")
+        ])
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         directoryURL = customDirectoryURL ?? base.appendingPathComponent("Codex Pulse", isDirectory: true)
         recordsURL = directoryURL.appendingPathComponent("requests.jsonl")
@@ -260,6 +354,30 @@ final class MetricStore {
 
     @discardableResult
     func importCodexHistory() -> Int {
+        if runtimeServiceTiers.refresh() {
+            var repaired = false
+            for index in apiCalls.indices {
+                let call = apiCalls[index]
+                if let tier = runtimeServiceTiers.tier(sessionID: call.sessionID, turnID: call.turnID,
+                                                      timestamp: call.timestamp), tier != call.serviceTier {
+                    apiCalls[index].serviceTier = tier
+                    repaired = true
+                }
+            }
+            if repaired {
+                rewriteAPICalls()
+                revision &+= 1
+            }
+            let now = isoFormatter.string(from: Date())
+            for path in Array(activeAPIBySource.keys) {
+                guard var call = activeAPIBySource[path],
+                      let tier = runtimeServiceTiers.tier(sessionID: call.sessionID, turnID: call.turnID,
+                                                         timestamp: now), tier != call.serviceTier else { continue }
+                call.serviceTier = tier
+                activeAPIBySource[path] = call
+                revision &+= 1
+            }
+        }
         if !UserDefaults.standard.bool(forKey: usageMigrationKey)
             || !UserDefaults.standard.bool(forKey: modelCallMigrationKey)
             || !UserDefaults.standard.bool(forKey: apiCallMigrationKey)
@@ -517,7 +635,8 @@ final class MetricStore {
                             timestamp: timestamp, model: turn.model,
                             responseModel: pendingUsageRecord?.responseModel ?? timing?.responseModel,
                             effort: turn.effort,
-                            serviceTier: timing?.serviceTier,
+                            serviceTier: runtimeServiceTiers.tier(sessionID: sessionID, turnID: turn.id,
+                                                                 timestamp: timestamp) ?? timing?.serviceTier,
                             ttftMS: inferredTTFT,
                             ttftEstimated: inferredTTFT == nil ? nil : true,
                             durationMS: inferredDuration,
@@ -593,11 +712,16 @@ final class MetricStore {
             } else if type == "turn_context" {
                 if let model = payload["model"] as? String { lastModel = model }
                 if let effort = payload["effort"] as? String { lastEffort = effort }
+                if let tier = payload["service_tier"] as? String { lastServiceTier = tier }
                 let id = payload["turn_id"] as? String
                 if var turn = pending, id == nil || id == turn.id {
                     turn.model = payload["model"] as? String ?? turn.model
                     turn.effort = payload["effort"] as? String ?? turn.effort
                     pending = turn
+                }
+                if var apiState = pendingAPIState, apiState.firstResponseTimestamp == nil {
+                    apiState.serviceTier = lastServiceTier
+                    pendingAPIState = apiState
                 }
             } else if type == "response_item", pending != nil, let itemType = payload["type"] as? String {
                 switch itemType {
@@ -651,7 +775,9 @@ final class MetricStore {
                 return ActiveAPICall(id: "active:\(sessionID):\(turn.id):\($0.startTimestamp)", sessionID: sessionID,
                                      turnID: turn.id, timestamp: $0.startTimestamp, model: turn.model,
                                      responseModel: $0.responseModel,
-                                     effort: turn.effort, serviceTier: $0.serviceTier,
+                                     effort: turn.effort,
+                                     serviceTier: runtimeServiceTiers.tier(sessionID: sessionID, turnID: turn.id,
+                                                                          timestamp: latestTimestamp) ?? $0.serviceTier,
                                      ttftMS: apiElapsedMS(from: $0.startTimestamp, to: $0.firstResponseTimestamp),
                                      ttftEstimated: $0.firstResponseTimestamp == nil ? nil : true,
                                      durationMS: apiElapsedMS(from: $0.startTimestamp, to: endTimestamp),
@@ -663,9 +789,11 @@ final class MetricStore {
     }
 
 #if PRICING_TESTS
-    func parseForTesting(file: URL) -> (completedCount: Int, active: Bool) {
+    func parseForTesting(file: URL) -> (completedCount: Int, active: Bool, serviceTiers: [String?], activeTier: String?) {
+        runtimeServiceTiers.refresh()
         let result = parse(file: file)
-        return (result.completed.count, result.activeAPI != nil)
+        return (result.completed.count, result.activeAPI != nil,
+                result.apiCalls.map(\.serviceTier), result.activeAPI?.serviceTier)
     }
 #endif
 
