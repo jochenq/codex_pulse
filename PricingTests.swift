@@ -8,7 +8,9 @@ struct PricingTests {
         runPricingRegressionTests()
         StatsWindowController.runOverviewRegressionTests()
         runIncrementalParserRegressionTest()
+        runAPICallTimingRegressionTest()
         runRuntimeServiceTierRegressionTest()
+        TiboMonitor.runRefreshRegressionTests()
         print("Pricing and incremental parser regression tests passed")
     }
 
@@ -44,6 +46,42 @@ struct PricingTests {
         precondition(second.completedCount == 1 && !second.active)
         let third = store.parseForTesting(file: file)
         precondition(third.completedCount == 0 && !third.active, "incremental states: \(first), \(second), \(third)")
+    }
+
+    private static func runAPICallTimingRegressionTest() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("codex-pulse-timing-test-\(UUID().uuidString)")
+        try! FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("session.jsonl")
+        let events = """
+        {"timestamp":"2026-10-17T08:00:00.000Z","type":"session_meta","payload":{"id":"timing-session"}}
+        {"timestamp":"2026-10-17T08:00:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"timing-turn"}}
+        {"timestamp":"2026-10-17T08:00:00.000Z","type":"turn_context","payload":{"turn_id":"timing-turn","model":"gpt-6.1-sol","effort":"high"}}
+        {"timestamp":"2026-10-17T08:00:04.000Z","type":"response_item","payload":{"type":"message","role":"assistant"}}
+        {"timestamp":"2026-10-17T08:00:04.100Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":40,"total_tokens":140},"last_token_usage":{"input_tokens":100,"output_tokens":40,"total_tokens":140}}}}
+        {"timestamp":"2026-10-17T08:00:08.100Z","type":"token_usage_record","payload":{"usage":{"input_tokens":40,"cached_input_tokens":10,"output_tokens":20,"total_tokens":60}}}
+        {"timestamp":"2026-10-17T08:00:08.200Z","type":"compacted","payload":{}}
+        {"timestamp":"2026-10-17T08:00:08.300Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":200},"last_token_usage":{"total_tokens":200}}}}
+        {"timestamp":"2026-10-17T08:00:10.300Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":270},"last_token_usage":{"input_tokens":50,"output_tokens":20,"total_tokens":70}}}}
+        {"timestamp":"2026-10-17T08:00:11.300Z","type":"response_item","payload":{"type":"function_call"}}
+        {"timestamp":"2026-10-17T08:00:21.300Z","type":"response_item","payload":{"type":"function_call_output"}}
+        {"timestamp":"2026-10-17T08:00:21.400Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":340},"last_token_usage":{"input_tokens":50,"output_tokens":20,"total_tokens":70}}}}
+        {"timestamp":"2026-10-17T08:00:23.300Z","type":"response_item","payload":{"type":"message","role":"assistant"}}
+        {"timestamp":"2026-10-17T08:00:23.400Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":410},"last_token_usage":{"input_tokens":50,"output_tokens":20,"total_tokens":70}}}}
+        {"timestamp":"2026-10-17T08:00:23.500Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"timing-turn","duration_ms":23500,"time_to_first_token_ms":4000}}
+
+        """
+        try! events.write(to: file, atomically: true, encoding: .utf8)
+        let store = MetricStore(directoryURL: directory.appendingPathComponent("store"), logDatabaseURLs: [])
+        let parsed = store.parseForTesting(file: file)
+        precondition(parsed.completedCount == 1 && !parsed.active)
+        precondition(parsed.apiCalls.map(\.durationMS) == [4_000, 4_000, 2_000, 1_000, 2_000],
+                     "single-call timings must include TTFT but exclude tool execution and other API calls")
+        precondition(parsed.apiCalls[0].ttftMS == 4_000)
+        precondition(parsed.apiCalls[1].operation == "compaction" && parsed.apiCalls[1].usage.output == 20)
+        precondition(parsed.apiCalls[2].ttftMS == nil && parsed.apiCalls[2].usage.output == 20,
+                     "usage-only/non-streaming completions must retain an end-to-end duration")
+        precondition(store.parseForTesting(file: file).apiCalls.isEmpty, "timing fallback must preserve incremental deduplication")
     }
 
     private static func runRuntimeServiceTierRegressionTest() {

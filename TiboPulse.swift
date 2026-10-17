@@ -38,6 +38,7 @@ private struct TiboPost: Codable {
     let url: String
     let avatarURL: String?
     let isReply: Bool
+    var evidenceSource: String? = nil
 }
 
 private struct TiboQueryCache: Codable {
@@ -49,6 +50,11 @@ private struct TiboQueryCache: Codable {
     var blocked = false
     var day = ""
     var attempts = 0
+
+    mutating func prepareManualRetry() {
+        blocked = false
+        nextAttempt = .distantPast
+    }
 }
 
 private struct AIActivityDigest: Decodable {
@@ -71,6 +77,7 @@ final class TiboMonitor {
     private let directTimelineURL = URL(string: "https://xcancel.com/thsottiaux")!
     private let directRepliesURL = URL(string: "https://xcancel.com/thsottiaux/with_replies")!
     private let syndicationURL = URL(string: "https://syndication.twitter.com/srv/timeline-profile/screen-name/thsottiaux")!
+    private let publicTranscriptURL = URL(string: "https://t.me/s/codexresetalerts")!
     private let queue = DispatchQueue(label: "com.codexpulse.tibo-monitor", qos: .utility)
     private let session: URLSession
     private let cacheURL: URL
@@ -82,13 +89,20 @@ final class TiboMonitor {
     private var pendingForcedCompletion: ((TiboActivitySnapshot) -> Void)?
     private(set) var snapshot: TiboActivitySnapshot
 
-    init() {
+#if PRICING_TESTS
+    private var testPostsResult: Result<[TiboPost], Error>?
+    private var testAnalysisResult: Result<AIActivityDigest, Error>?
+    private var testConfiguration: AIServiceConfiguration?
+    private var testAnalysisCount = 0
+#endif
+
+    init(directoryURL: URL? = nil) {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 25
         config.timeoutIntervalForResource = 75
         config.httpMaximumConnectionsPerHost = 1
         session = URLSession(configuration: config)
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let support = directoryURL ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
             .appendingPathComponent("Codex Pulse", isDirectory: true)
         try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
         cacheURL = support.appendingPathComponent("tibo-reset-activity-v2.json")
@@ -122,18 +136,30 @@ final class TiboMonitor {
                 return
             }
             self.running = true
+            self.recordCall(["event": "check_started", "manual": forceAnalysis])
+            if forceAnalysis {
+                self.queryCache.prepareManualRetry()
+                self.saveQueryCache()
+            }
             self.fetchPosts { result in
                 self.queue.async {
                     switch result {
                     case .success(let posts): self.handle(posts: posts, forceAnalysis: forceAnalysis, completion: completion)
-                    case .failure:
+                    case .failure(let error):
+                        let message = (error as? MonitorError)?.displayMessage ?? "公开动态获取失败，请稍后重试。"
+                        self.recordCall(["event": "source_fetch_failed", "reason": message])
+                        // Fresh cached evidence can still be retried after a temporary
+                        // source failure. Never send an expired timeline as current news.
+                        if forceAnalysis && self.isFresh(self.queryCache.posts) {
+                            self.handle(posts: [], forceAnalysis: true, sourceError: message, completion: completion)
+                            return
+                        }
                         self.snapshot.checkedAt = Date()
-                        if self.snapshot.latestPostAt.map({ Date().timeIntervalSince($0) > 14 * 24 * 60 * 60 }) ?? false {
-                            self.snapshot.headline = "公开时间线已过期"
-                            self.snapshot.summary = "X 返回的公开时间线不是最新内容，已暂停 AI 摘要，等待新数据源恢复。"
-                            self.snapshot.status = "source-stale"
-                        } else {
-                            self.snapshot.status = self.snapshot.analyzedAt == nil ? "fetch-error" : "stale"
+                        self.snapshot.status = "source-error"
+                        self.snapshot.analysisError = message + " 未取得有效帖子，未发起 AI 请求。"
+                        if self.snapshot.analyzedAt == nil {
+                            self.snapshot.headline = "公开动态获取失败"
+                            self.snapshot.summary = self.snapshot.analysisError!
                         }
                         self.save()
                         self.finish(completion)
@@ -144,6 +170,9 @@ final class TiboMonitor {
     }
 
     private func fetchPosts(completion: @escaping (Result<[TiboPost], Error>) -> Void) {
+#if PRICING_TESTS
+        if let testPostsResult { completion(testPostsResult); return }
+#endif
         let group = DispatchGroup()
         var primaryResult: Result<[TiboPost], Error>?
         var replies: [TiboPost] = []
@@ -159,20 +188,35 @@ final class TiboMonitor {
             let primary: [TiboPost]
             if case .success(let posts)? = primaryResult { primary = posts } else { primary = [] }
             let merged = self.mergedPosts(primary + replies)
-            if self.isFresh(merged) { completion(.success(merged)) }
-            else { completion(.failure(MonitorError.staleTimeline)) }
+            if self.isFresh(merged) { completion(.success(merged)); return }
+            // Public transcripts are a fallback only. Keep original X IDs and
+            // timestamps, and exclude the channel's predictions and commentary.
+            self.fetchPage(self.publicTranscriptURL) { result in
+                self.queue.async {
+                    if case .success(let html) = result {
+                        let posts = self.mergedPosts(merged + self.parsePublicTranscripts(html))
+                        if self.isFresh(posts) { completion(.success(posts)); return }
+                    }
+                    if case .failure(let error)? = primaryResult { completion(.failure(error)) }
+                    else { completion(.failure(MonitorError.staleTimeline)) }
+                }
+            }
         }
     }
 
     private func fetchPrimaryPosts(completion: @escaping (Result<[TiboPost], Error>) -> Void) {
         let group = DispatchGroup()
         var collected: [TiboPost] = []
+        var failures: [String] = []
         func fetch(_ url: URL, parser: @escaping (String) -> [TiboPost]) {
             group.enter()
             fetchPage(url) { result in
                 self.queue.async {
                     if case .success(let body) = result {
                         collected.append(contentsOf: parser(body))
+                    } else if case .failure(let error) = result {
+                        let detail = (error as? MonitorError)?.displayMessage ?? "网络连接失败"
+                        failures.append("\(url.host ?? "X")：\(detail)")
                     }
                     group.leave()
                 }
@@ -187,6 +231,8 @@ final class TiboMonitor {
         group.notify(queue: queue) {
             let posts = self.mergedPosts(collected)
             if self.isFresh(posts) { completion(.success(posts)) }
+            else if posts.isEmpty { completion(.failure(MonitorError.sourceUnavailable(failures.isEmpty
+                ? "公开页面未返回可解析的帖子。" : failures.sorted().joined(separator: "；")))) }
             else { completion(.failure(MonitorError.staleTimeline)) }
         }
     }
@@ -212,8 +258,13 @@ final class TiboMonitor {
         if url == liveMirrorURL { request.setValue("html", forHTTPHeaderField: "X-Return-Format") }
         session.dataTask(with: request) { data, response, error in
             if let error { completion(.failure(error)); return }
-            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
-                  let data, let html = String(data: data, encoding: .utf8) else {
+            guard let http = response as? HTTPURLResponse else {
+                completion(.failure(MonitorError.invalidResponse)); return
+            }
+            guard (200..<300).contains(http.statusCode) else {
+                completion(.failure(MonitorError.sourceHTTPStatus(http.statusCode))); return
+            }
+            guard let data, let html = String(data: data, encoding: .utf8) else {
                 completion(.failure(MonitorError.invalidResponse)); return
             }
             completion(.success(html))
@@ -354,11 +405,42 @@ final class TiboMonitor {
         return age >= -5 * 60 && age < 14 * 24 * 60 * 60
     }
 
+    private func parsePublicTranscripts(_ html: String) -> [TiboPost] {
+        let blocks = try! NSRegularExpression(pattern: #"<div class="tgme_widget_message_text js-message_text"[^>]*>(.*?)</div>"#,
+                                             options: [.dotMatchesLineSeparators])
+        let links = try! NSRegularExpression(pattern: #"https://x\.com/thsottiaux/status/(\d+)"#)
+        let quote = try! NSRegularExpression(pattern: #"“(.+?)”\s*[—-]\s*Tibo\b"#, options: [.dotMatchesLineSeparators])
+        let attribution = try! NSRegularExpression(pattern: #"(?:^|\n)Tibo:\s*(.+?)(?=\nhttps://|$)"#, options: [.dotMatchesLineSeparators])
+        let source = html as NSString
+        var posts: [TiboPost] = []
+        for block in blocks.matches(in: html, range: NSRange(location: 0, length: source.length)) {
+            let fragment = source.substring(with: block.range(at: 1))
+            let raw = fragment as NSString
+            let ids = Set(links.matches(in: fragment, range: NSRange(location: 0, length: raw.length))
+                .map { raw.substring(with: $0.range(at: 1)) })
+            guard ids.count == 1, let id = ids.first, let date = dateFromSnowflake(id) else { continue }
+            let text = stripHTML(fragment.replacingOccurrences(of: #"<br\s*/?>"#, with: "\n", options: .regularExpression))
+            let range = NSRange(text.startIndex..., in: text)
+            guard let match = quote.firstMatch(in: text, range: range) ?? attribution.firstMatch(in: text, range: range),
+                  let contentRange = Range(match.range(at: 1), in: text) else { continue }
+            let content = String(text[contentRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !content.isEmpty else { continue }
+            posts.append(TiboPost(id: id, text: content, publishedAt: date,
+                url: "https://x.com/thsottiaux/status/\(id)", avatarURL: nil, isReply: false,
+                evidenceSource: "public-transcript"))
+        }
+        return posts.sorted { $0.publishedAt > $1.publishedAt }
+    }
+
     private func mergedPosts(_ posts: [TiboPost]) -> [TiboPost] {
         var byID: [String: TiboPost] = [:]
         for candidate in posts {
             guard let current = byID[candidate.id] else {
                 byID[candidate.id] = candidate
+                continue
+            }
+            if current.evidenceSource != candidate.evidenceSource {
+                if candidate.evidenceSource == nil { byID[candidate.id] = candidate }
                 continue
             }
             if candidate.isReply != current.isReply {
@@ -406,7 +488,7 @@ final class TiboMonitor {
         return posts.sorted { $0.publishedAt > $1.publishedAt }
     }
 
-    private func handle(posts: [TiboPost], forceAnalysis: Bool,
+    private func handle(posts: [TiboPost], forceAnalysis: Bool, sourceError: String? = nil,
                         completion: @escaping (TiboActivitySnapshot) -> Void) {
         // Preserve known records when a mirror temporarily omits them.
         // A richer version can replace a short version; missing records cannot.
@@ -417,7 +499,7 @@ final class TiboMonitor {
         }.joined(separator: "\n")
         let fingerprint = SHA256.hash(data: Data(canonical.utf8)).map { String(format: "%02x", $0) }.joined()
         let latestReply = posts.first(where: \.isReply)
-        let configuration = AIConfigurationStore.shared.load()
+        let configuration = analysisConfiguration()
         let configID = SHA256.hash(data: Data((configuration.baseURL + "|" + configuration.model + "|" + configuration.apiKey).utf8))
             .map { String(format: "%02x", $0) }.joined()
         if queryCache.configuration != configID {
@@ -431,11 +513,16 @@ final class TiboMonitor {
         guard configuration.isConfigured else {
             snapshot.checkedAt = Date()
             snapshot.status = "missing-configuration"
+            snapshot.analysisError = "请先配置 AI 服务地址、模型与 API Key。"
+            if snapshot.analyzedAt == nil {
+                snapshot.headline = "尚未配置 AI 服务"
+                snapshot.summary = snapshot.analysisError!
+            }
             save()
             finish(completion)
             return
         }
-        if fingerprint == queryCache.successfulFingerprint, snapshot.analyzedAt != nil {
+        if !forceAnalysis, fingerprint == queryCache.successfulFingerprint, snapshot.analyzedAt != nil {
             snapshot.checkedAt = Date()
             if ["stale", "fetch-error", "source-stale"].contains(snapshot.status) {
                 snapshot.status = "current"
@@ -449,14 +536,12 @@ final class TiboMonitor {
             queryCache.day = String(today)
             queryCache.attempts = 0
         }
-        // Manual refresh obeys the same spending controls. Saving configuration
-        // explicitly allows retrying a blocked account after a top-up.
-        if forceAnalysis && queryCache.blocked {
-            queryCache.blocked = false
-            queryCache.nextAttempt = .distantPast
-        }
+        // Explicit manual retries bypass authentication pauses and backoff,
+        // while retaining the daily request budget and in-flight coalescing.
+        if forceAnalysis { queryCache.prepareManualRetry() }
         if queryCache.blocked || Date() < queryCache.nextAttempt || queryCache.attempts >= 24 {
             snapshot.checkedAt = Date()
+            snapshot.status = queryCache.blocked ? "analysis-blocked" : "analysis-waiting"
             if queryCache.blocked {
                 snapshot.analysisError = "AI 自动请求已暂停，请检查余额或配置，处理后重新保存 AI 配置恢复。"
             } else if queryCache.attempts >= 24 {
@@ -464,6 +549,7 @@ final class TiboMonitor {
             } else {
                 snapshot.analysisError = "已缓存最新帖子，等待下次 AI 分析时段。"
             }
+            recordCall(["event": "analysis_skipped", "reason": snapshot.analysisError!])
             saveQueryCache()
             save()
             finish(completion)
@@ -473,7 +559,9 @@ final class TiboMonitor {
         queryCache.attempts += 1
         queryCache.nextAttempt = Date().addingTimeInterval(30 * 60)
         saveQueryCache()
-        analyze(posts: posts, configuration: configuration) { result in
+        let cutoff = Date().addingTimeInterval(-14 * 24 * 60 * 60)
+        let analysisPosts = posts.filter { $0.publishedAt >= cutoff && $0.publishedAt <= Date().addingTimeInterval(5 * 60) }
+        analyze(posts: analysisPosts, configuration: configuration) { result in
             self.queue.async {
                 let digest: AIActivityDigest
                 let status: String
@@ -494,7 +582,7 @@ final class TiboMonitor {
                     }
                     self.saveQueryCache()
                     self.snapshot.checkedAt = Date()
-                    self.snapshot.status = "analysis-error"
+                    self.snapshot.status = self.queryCache.blocked ? "analysis-blocked" : "analysis-error"
                     self.snapshot.analysisError = (error as? MonitorError)?.displayMessage ?? "AI 网络请求失败，请检查网络或服务配置"
                     if self.snapshot.analyzedAt == nil {
                         self.snapshot.headline = "重置消息暂未分析完成"
@@ -506,6 +594,14 @@ final class TiboMonitor {
                 }
                 self.apply(digest: digest, status: status, posts: posts,
                            fingerprint: fingerprint, latestReply: latestReply)
+                if !self.isFresh(posts.filter { $0.evidenceSource == nil }) {
+                    self.snapshot.status = "transcript-analysis"
+                    self.snapshot.analysisError = "直接动态源不可用，本次依据公开转录中的 Tibo 引文与原帖链接；转录不保证覆盖完整时间线。"
+                }
+                if let sourceError {
+                    self.snapshot.status = "cached-analysis"
+                    self.snapshot.analysisError = sourceError + " 本次分析使用缓存帖子，未确认最新动态。"
+                }
                 self.save()
                 self.finish(completion)
             }
@@ -540,6 +636,13 @@ final class TiboMonitor {
 
     private func analyze(posts: [TiboPost], configuration: AIServiceConfiguration,
                          completion: @escaping (Result<AIActivityDigest, Error>) -> Void) {
+#if PRICING_TESTS
+        if let testAnalysisResult {
+            testAnalysisCount += 1
+            completion(testAnalysisResult)
+            return
+        }
+#endif
         let formatter = ISO8601DateFormatter()
         let evidence: [[String: Any]] = posts.sorted { $0.publishedAt < $1.publishedAt }.map { post in
             [
@@ -547,7 +650,8 @@ final class TiboMonitor {
                 "kind": post.isReply ? "reply" : "post",
                 "published_at_utc": formatter.string(from: post.publishedAt),
                 "text": post.text,
-                "url": post.url
+                "url": post.url,
+                "evidence_source": post.evidenceSource ?? "public-x-mirror"
             ]
         }
         guard let evidenceData = try? JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys]),
@@ -561,7 +665,7 @@ final class TiboMonitor {
         1. 从所有主帖及回复中寻找额度重置、补发重置卡、恢复用量或重置时间的确切消息。优先最近的相关消息，无关的模型发布、日常闲聊不作为摘要主题。
         2. 用中文讲清：哪一天说了什么、是已经重置还是计划或暗示、涉及哪些人以及何时生效。原文未说明的部分不要补充。用量优化、上下文扩大不等于重置，不得混淆。玩笑和条件性承诺不能说成已经兑现。
         3. 如果只有旧消息，明确标注其日期和“此前”；如果本批帖子没有相关证据，标题为“未发现新的重置消息”，摘要明确“本次取得的公开帖子中未发现明确的额度重置公告”。这不代表完整时间线中绝对没有消息。
-        4. 不分析人物状态、位置或时区。简体中文输出，保留必要产品名；禁止直接复制英语正文。headline 最多18字，summary 最多90字。sourcePostID 为支持核心结论的输入帖子 ID，没有相关消息则为 null。
+        4. 不分析人物状态、位置或时区。简体中文输出，保留必要产品名；禁止直接复制英语正文。headline 最多18字，summary 最多90字。sourcePostID 必须逐字复制支持核心结论的 post_id 字符串，不能转换成数字或网址；没有相关消息则为 null。标记 public-transcript 的条目来自公开转载，不保证覆盖完整时间线。
 
         只输出 JSON，不要 Markdown：{"headline":"中文标题","summary":"中文摘要","sourcePostID":null}。输出前检查事实、日期和长度。
         """
@@ -607,6 +711,7 @@ final class TiboMonitor {
                          "request_bytes": json.count, "post_count": posts.count])
         session.dataTask(with: request) { data, response, error in
             var outcome = "failed"
+            var validationError: String?
             defer {
                 var record: [String: Any] = [
                     "event": "finished", "request_id": requestID, "model": configuration.model,
@@ -614,6 +719,7 @@ final class TiboMonitor {
                     "duration_ms": Int(Date().timeIntervalSince(started) * 1000),
                     "outcome": outcome
                 ]
+                record["validation_error"] = validationError
                 if let data, let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                     record["usage"] = root["usage"]
                     record["provider_request_id"] = root["id"]
@@ -637,19 +743,93 @@ final class TiboMonitor {
             }
             // Only parse the final answer; internal reasoning is not a result.
             let content = (message["content"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let extracted = extractedJSONObject(from: content)
-            guard let contentData = extracted?.data(using: .utf8),
-                  let digest = try? JSONDecoder().decode(AIActivityDigest.self, from: contentData),
-                  !digest.headline.isEmpty, !digest.summary.isEmpty,
-                  digest.headline.range(of: "[\u{4E00}-\u{9FFF}]", options: .regularExpression) != nil,
-                  digest.summary.range(of: "[\u{4E00}-\u{9FFF}]", options: .regularExpression) != nil,
-                  digest.sourcePostID == nil || posts.contains(where: { $0.id == digest.sourcePostID }) else {
+            let digest: AIActivityDigest
+            do {
+                digest = try parsedActivityDigest(content, validPostIDs: Set(posts.map(\.id)))
+            } catch {
+                validationError = (error as? DigestValidationError)?.rawValue ?? "invalid_result"
                 completion(.failure(MonitorError.analysisFailed)); return
             }
             outcome = "success"
             completion(.success(digest))
         }.resume()
     }
+
+    private func analysisConfiguration() -> AIServiceConfiguration {
+#if PRICING_TESTS
+        if let testConfiguration { return testConfiguration }
+#endif
+        return AIConfigurationStore.shared.load()
+    }
+
+#if PRICING_TESTS
+    static func runRefreshRegressionTests() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("tibo-refresh-test-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let monitor = TiboMonitor(directoryURL: directory)
+        let transcript = """
+        <div class="tgme_widget_message_text js-message_text">93% chance!<br/>“Reset all propagated.”<br/>— Tibo<br/><a href="https://x.com/thsottiaux/status/2106131810921136451">Source</a></div>
+        <div class="tgme_widget_message_text js-message_text">We predict a reset!<br/><a href="https://x.com/thsottiaux/status/2106131810921136451">Source</a></div>
+        """
+        let transcribed = monitor.parsePublicTranscripts(transcript)
+        precondition(transcribed.count == 1 && transcribed[0].text == "Reset all propagated.")
+        precondition(transcribed[0].evidenceSource == "public-transcript")
+        let validDigest = #"{"headline":"重置已完成","summary":"10月3日确认额度重置已生效。","sourcePostID":"2106131810921136451"}"#
+        let ids = Set(["2106131810921136451"])
+        precondition((try? parsedActivityDigest(validDigest, validPostIDs: ids))?.headline == "重置已完成")
+        precondition((try? parsedActivityDigest(validDigest.replacingOccurrences(of: #""2106131810921136451""#, with: "2106131810921136451"), validPostIDs: ids)) != nil)
+        precondition((try? parsedActivityDigest(validDigest, validPostIDs: [])) == nil)
+        precondition((try? parsedActivityDigest(#"{"headline":"English","summary":"English only","sourcePostID":null}"#, validPostIDs: ids)) == nil)
+        monitor.testConfiguration = AIServiceConfiguration(baseURL: "https://example.test/v1", apiKey: "test-key", model: "test-model")
+        let post = TiboPost(id: "test-post", text: "Usage reset announced", publishedAt: Date(),
+                            url: "https://x.com/thsottiaux/status/test-post", avatarURL: nil, isReply: false)
+        monitor.testPostsResult = .success([post])
+        monitor.testAnalysisResult = .success(AIActivityDigest(headline: "重置测试", summary: "测试中文摘要", sourcePostID: post.id,
+                                                              activityState: nil, location: nil, timeZone: nil, locationMode: nil))
+        func check(_ manual: Bool) -> TiboActivitySnapshot {
+            var result: TiboActivitySnapshot?
+            monitor.check(forceAnalysis: manual) { result = $0 }
+            let deadline = Date().addingTimeInterval(5)
+            while result == nil && Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
+            precondition(result != nil, "refresh must complete")
+            return result!
+        }
+        precondition(check(true).status == "current")
+        precondition(monitor.testAnalysisCount == 1)
+        _ = check(false)
+        precondition(monitor.testAnalysisCount == 1, "automatic refresh must reuse unchanged evidence")
+        monitor.queue.sync {
+            monitor.queryCache.blocked = true
+            monitor.queryCache.nextAttempt = Date().addingTimeInterval(3600)
+        }
+        precondition(check(true).status == "current")
+        precondition(monitor.testAnalysisCount == 2, "manual refresh must retry blocked and unchanged evidence")
+        monitor.testAnalysisResult = .failure(MonitorError.apiRejected(401))
+        precondition(check(true).status == "analysis-blocked")
+        monitor.testPostsResult = .failure(MonitorError.sourceUnavailable("HTTP 429"))
+        monitor.queue.sync { monitor.queryCache.posts = [] }
+        let failed = check(true)
+        precondition(failed.status == "source-error")
+        precondition(failed.analysisError?.contains("未发起 AI 请求") == true)
+        precondition(failed.analysisError?.contains("认证") == false, "source failure must replace old authentication error")
+        precondition(monitor.testAnalysisCount == 3)
+        monitor.testAnalysisResult = .success(AIActivityDigest(headline: "重置测试", summary: "测试中文摘要", sourcePostID: post.id,
+                                                              activityState: nil, location: nil, timeZone: nil, locationMode: nil))
+        monitor.queue.sync { monitor.queryCache.posts = [post] }
+        precondition(check(true).status == "cached-analysis")
+        precondition(monitor.testAnalysisCount == 4, "manual retry may use fresh cached evidence")
+        monitor.queue.sync {
+            monitor.queryCache.posts = [TiboPost(id: post.id, text: post.text,
+                publishedAt: Date().addingTimeInterval(-15 * 24 * 3600), url: post.url, avatarURL: nil, isReply: false)]
+        }
+        precondition(check(true).status == "source-error")
+        precondition(monitor.testAnalysisCount == 4, "expired cache must not be sent as current evidence")
+        monitor.queue.sync { monitor.queryCache.posts = [post] }
+        monitor.queue.sync { monitor.queryCache.attempts = 24 }
+        _ = check(true)
+        precondition(monitor.testAnalysisCount == 4, "manual retry must retain daily budget")
+    }
+#endif
 
     private func finish(_ completion: @escaping (TiboActivitySnapshot) -> Void) {
         running = false
@@ -689,9 +869,13 @@ private enum MonitorError: Error {
     case invalidResponse, noPosts, staleTimeline, invalidRequest, analysisFailed
     case apiRejected(Int)
     case inputBudgetExceeded
+    case sourceHTTPStatus(Int), sourceUnavailable(String)
 
     var displayMessage: String {
         switch self {
+        case .staleTimeline: return "公开动态源返回的帖子已超过 14 天，无法确认最新消息。"
+        case .sourceHTTPStatus(let status): return "HTTP \(status)"
+        case .sourceUnavailable(let detail): return "公开动态源不可用（\(detail)）"
         case .inputBudgetExceeded: return "公开证据超过单次 96 KB 输入预算，已暂停本次分析以避免额外消耗。"
         case .apiRejected(402): return "AI 服务余额不足，请充值或在设置中更换可用服务。"
         case .apiRejected(401), .apiRejected(403): return "AI 服务认证失败，请检查 API Key 或权限。"
@@ -781,6 +965,25 @@ private func normalizedActivityState(_ value: String?) -> String {
     return limitedText(normalized, maximum: 5)
 }
 
+private enum DigestValidationError: String, Error {
+    case missingJSON = "missing_json", invalidSchema = "invalid_schema"
+    case nonChinese = "non_chinese_result", invalidSource = "unknown_source_id"
+}
+
+private func parsedActivityDigest(_ content: String, validPostIDs: Set<String>) throws -> AIActivityDigest {
+    guard let extracted = extractedJSONObject(from: content), let data = extracted.data(using: .utf8),
+          var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw DigestValidationError.missingJSON }
+    // Some compatible providers emit a numeric post ID. Keep the integer
+    // representation and still require an exact match in the input evidence.
+    if let number = object["sourcePostID"] as? NSNumber { object["sourcePostID"] = number.stringValue }
+    guard let normalized = try? JSONSerialization.data(withJSONObject: object),
+          let digest = try? JSONDecoder().decode(AIActivityDigest.self, from: normalized) else { throw DigestValidationError.invalidSchema }
+    guard digest.headline.unicodeScalars.contains(where: { (0x4E00...0x9FFF).contains($0.value) }),
+          digest.summary.unicodeScalars.contains(where: { (0x4E00...0x9FFF).contains($0.value) }) else { throw DigestValidationError.nonChinese }
+    guard digest.sourcePostID.map({ validPostIDs.contains($0) }) ?? true else { throw DigestValidationError.invalidSource }
+    return digest
+}
+
 private func extractedJSONObject(from text: String) -> String? {
     var start: String.Index?
     var depth = 0
@@ -803,7 +1006,7 @@ private func extractedJSONObject(from text: String) -> String? {
             if depth == 0, let start {
                 let candidate = String(text[start...index])
                 if let data = candidate.data(using: .utf8),
-                   (try? JSONDecoder().decode(AIActivityDigest.self, from: data)) != nil {
+                   (try? JSONSerialization.jsonObject(with: data)) is [String: Any] {
                     return candidate
                 }
             }

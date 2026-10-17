@@ -628,8 +628,14 @@ final class MetricStore {
                         let timing = completedAPIStateAwaitingUsage ?? pendingAPIState
                         let inferredTTFT = apiElapsedMS(from: timing?.startTimestamp,
                                                        to: timing?.firstResponseTimestamp)
+                        // Non-streaming responses can report usage without any
+                        // response-item/first-token event. The usage receipt is
+                        // then the observable end of this API call, not the turn.
+                        let completionTimestamp = timing?.lastResponseTimestamp
+                            ?? (authoritativeUsage != nil ? pendingUsageRecord?.timestamp : nil)
+                            ?? timestamp
                         let inferredDuration = apiElapsedMS(from: timing?.startTimestamp,
-                                                           to: timing?.lastResponseTimestamp)
+                                                           to: completionTimestamp)
                         apiCallResult.append(APICallMetric(
                             id: "\(sessionID):\(timestamp)", sessionID: sessionID, turnID: turn.id,
                             timestamp: timestamp, model: turn.model,
@@ -789,11 +795,11 @@ final class MetricStore {
     }
 
 #if PRICING_TESTS
-    func parseForTesting(file: URL) -> (completedCount: Int, active: Bool, serviceTiers: [String?], activeTier: String?) {
+    func parseForTesting(file: URL) -> (completedCount: Int, active: Bool, serviceTiers: [String?], activeTier: String?, apiCalls: [APICallMetric]) {
         runtimeServiceTiers.refresh()
         let result = parse(file: file)
         return (result.completed.count, result.activeAPI != nil,
-                result.apiCalls.map(\.serviceTier), result.activeAPI?.serviceTier)
+                result.apiCalls.map(\.serviceTier), result.activeAPI?.serviceTier, result.apiCalls)
     }
 #endif
 
@@ -1291,7 +1297,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSWorkspace.shared.open(url)
         }
         popoverController.onConfigureAI = { [weak self] in self?.showAIConfiguration() }
-        popoverController.onRefreshTibo = { [weak self] in self?.refreshTibo() }
+        popoverController.onRefreshTibo = { [weak self] in self?.refreshTibo(forceAnalysis: true) }
         popoverController.onQuit = { NSApp.terminate(nil) }
         popover = NSPopover()
         popover.behavior = .transient
@@ -1306,7 +1312,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePopover)
         refresh()
-        refreshTibo()
+        refreshTibo(forceAnalysis: CommandLine.arguments.contains("--refresh-tibo"))
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.refresh() }
         tiboTimer = Timer.scheduledTimer(withTimeInterval: tiboAutomaticRefreshInterval, repeats: true) { [weak self] _ in
             self?.refreshTibo()
@@ -1351,7 +1357,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func manualRefresh() {
         popoverController.noteRefreshRequested()
-        refreshTibo()
+        refreshTibo(forceAnalysis: true)
         refresh(force: true)
     }
 

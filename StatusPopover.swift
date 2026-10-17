@@ -162,6 +162,16 @@ final class StatusPopoverController: NSViewController {
             tiboMeta.stringValue = snapshot.analyzedAt == nil
                 ? "中文分析失败，将自动重试 · " + checked
                 : "更新失败，保留上次中文分析 · " + checked
+        case "analysis-blocked":
+            tiboMeta.stringValue = "AI 请求已暂停，点击刷新可重试 · " + checked
+        case "analysis-waiting":
+            tiboMeta.stringValue = (snapshot.analysisError ?? "等待下次分析") + " · " + checked
+        case "source-error":
+            tiboMeta.stringValue = "公开动态获取失败，未发起 AI 请求 · " + checked
+        case "cached-analysis":
+            tiboMeta.stringValue = "缓存帖子分析，未确认最新动态 · " + checked + latest
+        case "transcript-analysis":
+            tiboMeta.stringValue = "公开转录分析 · " + checked + latest
         case "current-fallback":
             tiboMeta.stringValue = "原文回退 · " + checked + latest
         case "loading":
@@ -236,7 +246,7 @@ final class StatusPopoverController: NSViewController {
 
     private func makeStatsRow() -> NSView {
         let row = NSStackView(); row.orientation = .horizontal; row.distribution = .fillEqually; row.spacing = 8
-        row.addArrangedSubview(stat("今日调用次数", callsValue)); row.addArrangedSubview(stat("今日 Token 总数", tokensValue)); row.addArrangedSubview(stat("今日等价花费", costValue))
+        row.addArrangedSubview(stat("今日调用", callsValue)); row.addArrangedSubview(stat("今日 Token", tokensValue)); row.addArrangedSubview(stat("今日估值", costValue))
         return row
     }
 
