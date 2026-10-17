@@ -77,6 +77,7 @@ private struct OverviewData {
     let groups: [GroupStats]
     let chart: [DailyPoint]
     let summary: [String]
+    let tokenRate: Double?
     let subtitle: String
     let completedCalls: Int
     let activeCalls: Int
@@ -275,7 +276,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         let value = metricBox("估值", help: "逐次按模型、服务档位和长上下文 API 单价估算；未公布价格的调用不计入已知部分，不代表实际账单", style: .primary, highlighted: true)
         let typical = metricBox("首响 P50", help: "一半请求的首响应时间不超过这个值", style: .secondary)
         let slower = metricBox("耗时 P95", help: "95% 的请求总耗时不超过这个值", style: .secondary)
-        let tokenRate = metricBox("速率", help: "输出 Token 总量 ÷ 单次调用总耗时之和，包含首 Token 等待；压缩与非流式调用同样计入，缺少有效耗时或用量拆分的调用除外", style: .secondary)
+        let tokenRate = metricBox("速率", help: "输出 Token 总量 ÷ 单次调用总耗时之和，包含首 Token 等待；压缩与非流式调用同样计入，缺少有效耗时或用量拆分的调用除外\n" + tokenRateColorHelp, style: .secondary)
         let cache = metricBox("缓存命中", help: "输入 Token 中由缓存直接复用的比例", style: .secondary)
         let reasoning = metricBox("推理占比", help: "输出 Token 中用于模型推理的比例", style: .secondary)
         summaryValues = [calls.1, total.1, value.1, typical.1, slower.1, tokenRate.1, cache.1, reasoning.1]
@@ -670,6 +671,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         rebuildFilterChoices(models: result.models, efforts: result.efforts)
         groupRows = result.groups
         for (label, value) in zip(summaryValues, result.summary) { label.stringValue = value }
+        summaryValues[5].textColor = tokenRateColor(result.tokenRate)
         summaryValues.first?.toolTip = "\(result.completedCalls) 次已完成 · \(result.activeCalls) 次进行中"
         summaryValues.dropFirst().first?.toolTip = "包含进行中会话已上报的 Token；尚未上报的用量不作推测"
         summaryValues[2].toolTip = "只估算已完成且有完整用量的 API 调用；进行中的调用尚无最终价格"
@@ -865,6 +867,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         let activeSuffix = filteredLive.isEmpty ? "" : "（\(compactNumber(filteredLive.count)) 进行中）"
         let callSuffix = activeCalls == 0 ? "" : " · \(compactNumber(activeCalls)) 进行中"
         let compactionSuffix = compactions == 0 ? "" : " · 压缩 \(compactNumber(compactions))"
+        let rate = aggregateTokenRate(filteredCalls)
         return OverviewData(
             models: models, efforts: efforts, groups: groups,
             chart: dailyPoints(records: filteredRecords, live: filteredLive, active: filteredActive,
@@ -873,9 +876,10 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
                       costLabel,
                       ttfts.isEmpty ? "--" : formatDuration(percentile(ttfts, 0.50)),
                       durations.isEmpty ? "--" : formatDuration(percentile(durations, 0.95)),
-                      formatTokenRate(aggregateTokenRate(filteredCalls)),
+                      formatTokenRate(rate),
                       percent(usage.input > 0 ? Double(usage.cached) / Double(usage.input) : 0),
                       percent(usage.output > 0 ? Double(usage.reasoning) / Double(usage.output) : 0)],
+            tokenRate: rate,
             subtitle: "任务 \(compactNumber(filteredRecords.count + filteredLive.count))\(activeSuffix) · 已完成 \(compactNumber(completedCalls))\(callSuffix)\(compactionSuffix)",
             completedCalls: completedCalls, activeCalls: activeCalls
         )
@@ -1066,6 +1070,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         default: value = ""
         }
         cell.textField?.stringValue = value
+        cell.textField?.textColor = id.rawValue == "rate" ? tokenRateColor(stats.tokenRate) : .labelColor
         cell.textField?.alignment = .left
         switch id.rawValue {
         case "group": cell.toolTip = value
@@ -1076,7 +1081,7 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
         case "reasoning": cell.toolTip = fullNumber(stats.reasoning) + " Token"
         case "value": cell.toolTip = value == "待完成"
             ? "进行中调用尚无最终用量，完成后才能估算价值" : costSummaryTooltip(stats.cost)
-        case "rate": cell.toolTip = "输出 Token 总量 ÷ 单次调用总耗时之和（含首 Token 等待、压缩与非流式调用）；缺少有效耗时或用量拆分的调用不计入"
+        case "rate": cell.toolTip = "输出 Token 总量 ÷ 单次调用总耗时之和（含首 Token 等待、压缩与非流式调用）；缺少有效耗时或用量拆分的调用不计入\n" + tokenRateColorHelp
         default: cell.toolTip = nil
         }
         return cell
@@ -1122,9 +1127,9 @@ final class StatsWindowController: NSWindowController, NSTableViewDataSource, NS
             let firstDetail = compacting ? "压缩无独立首 Token 观测"
                 : unreliableTTFT ? "首 Token 估算不可靠，已隐藏；不影响按总耗时计算速率"
                 : "首 Token \(item.ttftMS.map { "\($0)ms" } ?? "未知")"
-            let details = "\(firstDetail) · 总耗时 \(item.durationMS.map { "\($0)ms" } ?? "未知")\n速率 = 输出 Token ÷ 单次调用总耗时，包含首 Token 等待；压缩与非流式同口径"
+            let details = "\(firstDetail) · 总耗时 \(item.durationMS.map { "\($0)ms" } ?? "未知")\n速率 = 输出 Token ÷ 单次调用总耗时，包含首 Token 等待；压缩与非流式同口径\n" + tokenRateColorHelp
             cell.configure(primary: compacting ? "耗 \(duration)" : "首 \(first)  ·  耗 \(duration)",
-                           secondary: rate, toolTip: details)
+                           secondary: rate, secondaryColor: tokenRateColor(item.tokenRate), toolTip: details)
         case "api_usage":
             if let usage = item.usage {
                 let hasDetails = usageHasBreakdown(usage)
@@ -1583,6 +1588,29 @@ private func formatTokenRate(_ value: Double?) -> String {
     return String(format: "%.2f tk/s", value)
 }
 
+private let tokenRateColorHelp = "速率配色（tk/s）：≤20 最红 · 40 及格 · ≥60 正常 · ≥90 最绿；中间渐变"
+
+private enum TokenRatePalette {
+    static let normal = NSColor.systemGreen.blended(withFraction: 0.35, of: .systemYellow) ?? .systemGreen
+}
+
+private func tokenRateColor(_ value: Double?) -> NSColor {
+    guard let value, value.isFinite, value >= 0 else { return .secondaryLabelColor }
+    // Only visible labels request colors; the history aggregation stays numeric.
+    // Clamp the endpoints so very fast/slow requests do not change the scale.
+    if value <= 20 { return .systemRed }
+    if value < 40 {
+        return NSColor.systemRed.blended(withFraction: CGFloat((value - 20) / 20), of: .systemOrange) ?? .systemRed
+    }
+    if value < 60 {
+        return NSColor.systemOrange.blended(withFraction: CGFloat((value - 40) / 20), of: TokenRatePalette.normal) ?? .systemOrange
+    }
+    if value < 90 {
+        return TokenRatePalette.normal.blended(withFraction: CGFloat((value - 60) / 30), of: .systemGreen) ?? .systemGreen
+    }
+    return .systemGreen
+}
+
 private func elapsedMS(since timestamp: String) -> Int {
     guard let start = metricDate(timestamp) else { return 0 }
     return max(0, Int(Date().timeIntervalSince(start) * 1_000))
@@ -1763,6 +1791,39 @@ private func pricingTooltip(model: String, serviceTier: String?, usage: TokenUsa
 }
 
 #if PRICING_TESTS
+func runTokenRateColorRegressionTests() {
+    func components(_ color: NSColor) -> [CGFloat] {
+        let rgb = color.usingColorSpace(.sRGB)!
+        return [rgb.redComponent, rgb.greenComponent, rgb.blueComponent, rgb.alphaComponent]
+    }
+    func sameColor(_ lhs: NSColor, _ rhs: NSColor) -> Bool {
+        zip(components(lhs), components(rhs)).allSatisfy { abs($0 - $1) < 0.000_001 }
+    }
+    precondition(sameColor(tokenRateColor(0), .systemRed))
+    precondition(sameColor(tokenRateColor(20), .systemRed))
+    precondition(sameColor(tokenRateColor(40), .systemOrange))
+    precondition(sameColor(tokenRateColor(60), TokenRatePalette.normal))
+    precondition(sameColor(tokenRateColor(90), .systemGreen))
+    precondition(sameColor(tokenRateColor(100), tokenRateColor(90)))
+    precondition(sameColor(tokenRateColor(10_000), tokenRateColor(90)))
+    for value: Double? in [nil, -1, .nan, .infinity, -.infinity] {
+        precondition(tokenRateColor(value).isEqual(NSColor.secondaryLabelColor), "unknown rates must stay neutral")
+    }
+    // The green/red balance must improve continuously, including at 40 and 60.
+    var previousBalance: CGFloat = -1
+    for rate in stride(from: 20.0, through: 90.0, by: 0.5) {
+        let rgb = components(tokenRateColor(rate))
+        let balance = rgb[1] / (rgb[0] + rgb[1])
+        precondition(balance > previousBalance, "speed must become progressively greener")
+        previousBalance = balance
+    }
+    for boundary in [40.0, 60.0, 90.0] {
+        let left = components(tokenRateColor(boundary - 0.001))
+        let right = components(tokenRateColor(boundary))
+        precondition(zip(left, right).allSatisfy { abs($0 - $1) < 0.001 }, "color boundaries must be continuous")
+    }
+}
+
 func runPricingRegressionTests() {
     func approx(_ actual: Double?, _ expected: Double) {
         assert(actual.map { abs($0 - expected) < 0.000_001 } == true,

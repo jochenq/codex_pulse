@@ -6,6 +6,7 @@ import SQLite3
 struct PricingTests {
     static func main() {
         runPricingRegressionTests()
+        runTokenRateColorRegressionTests()
         StatsWindowController.runOverviewRegressionTests()
         runIncrementalParserRegressionTest()
         runAPICallTimingRegressionTest()
