@@ -1639,14 +1639,16 @@ private func matchesModel(_ model: String, _ base: String) -> Bool {
 private func apiPrice(for rawModel: String, serviceTier: String?, inputTokens: Int) -> APIPrice? {
     let model = rawModel.lowercased()
     let tier = serviceTier?.lowercased() ?? "default"
-    guard tier != "ultrafast" else { return nil } // No published Ultrafast rate card.
-    guard ["default", "standard", "priority", "fast"].contains(tier) else { return nil }
+    guard ["default", "standard", "priority", "fast", "ultrafast"].contains(tier) else { return nil }
     let fast = tier == "priority" || tier == "fast"
+    let ultra = tier == "ultrafast"
+    let supportsUltra = matchesModel(model, "gpt-6-astra") || matchesModel(model, "gpt-6.1-sol")
+    guard !ultra || supportsUltra else { return nil }
     let longContext = inputTokens > 272_000
-    let rateMultiplier = fast ? 2.0 : 1.0
+    let rateMultiplier = ultra ? 6.0 : fast ? 2.0 : 1.0
     let inputMultiplier = longContext ? 2.0 : 1.0
     let outputMultiplier = longContext ? 1.5 : 1.0
-    let tierName = fast ? "Fast" : "标准"
+    let tierName = ultra ? "Ultra Fast" : fast ? "Fast" : "标准"
     func latest(_ name: String, _ input: Double, _ cached: Double, _ output: Double) -> APIPrice {
         APIPrice(name: name, input: input * inputMultiplier * rateMultiplier,
                  cached: cached * inputMultiplier * rateMultiplier,
@@ -1663,6 +1665,9 @@ private func apiPrice(for rawModel: String, serviceTier: String?, inputTokens: I
     }
     if matchesModel(model, "gpt-6.1-sol") {
         return latest("GPT-6.1 Sol", 2, 0.1, 10)
+    }
+    if matchesModel(model, "gpt-6.1-terra") {
+        return latest("GPT-6.1 Terra", 1, 0.05, 5)
     }
     if matchesModel(model, "gpt-6-sol") {
         return latest("GPT-6 Sol", 2, 0.2, 10)
@@ -1763,7 +1768,7 @@ func formatAPICost(_ summary: APICostSummary) -> String {
 private func costSummaryTooltip(_ summary: APICostSummary) -> String {
     let known = "已按对应 API 档位计价 \(summary.pricedCalls) 次：\(formatUSD(summary.knownUSD))。"
     if summary.unpricedCalls == 0 { return known + "\n估算值不代表订阅套餐或第三方渠道的实际账单。" }
-    return known + "\n另有 \(summary.unpricedCalls) 次价格未知（如 Ultra Fast 未公布单价、第三方模型或缺少 Token 拆分）；显示的是已知部分下限，不代表实际账单。"
+    return known + "\n另有 \(summary.unpricedCalls) 次价格未知（如未公布价格的模型／档位、第三方模型或缺少 Token 拆分）；显示的是已知部分下限，不代表实际账单。"
 }
 
 func formatUSD(_ value: Double?) -> String {
@@ -1775,11 +1780,8 @@ func formatUSD(_ value: Double?) -> String {
 }
 
 private func pricingTooltip(model: String, serviceTier: String?, usage: TokenUsage) -> String {
-    if serviceTier?.lowercased() == "ultrafast" {
-        return "Ultra Fast 目前为限量预览，OpenAI 尚未公布该档位的每百万 Token 单价；不能沿用标准或 Fast 价。"
-    }
     guard let price = apiPrice(for: model, serviceTier: serviceTier, inputTokens: usage.input) else {
-        return "没有可匹配的该模型／服务档位官方 API 价格，暂不估算；第三方渠道可能另有报价。"
+        return "没有可匹配的该模型／服务档位官方 API 价格，暂不估算；Ultra Fast 仅对公布价格的模型估算，第三方渠道可能另有报价。"
     }
     guard let value = estimatedAPICost(model: model, serviceTier: serviceTier, usage: usage) else {
         return "该调用缺少输入与输出 Token 拆分，无法可靠估算价值"
@@ -1844,7 +1846,6 @@ func runPricingRegressionTests() {
     let boundary = TokenUsage(input: 272_000, cached: 100_000, output: 10_000,
                               reasoning: 0, total: 282_000)
     approx(estimatedAPICost(model: "gpt-6.1-sol", serviceTier: "standard", usage: boundary), 0.454)
-    assert(estimatedAPICost(model: "gpt-6.1-sol", serviceTier: "ultrafast", usage: short) == nil)
     approx(estimatedAPICost(model: "gpt-6-sol", serviceTier: "default", usage: long), 0.99)
     approx(estimatedAPICost(model: "gpt-5.6-sol", serviceTier: "priority", usage: long), 3.96)
     assert(estimatedAPICost(model: "gpt-5.6-sol", serviceTier: "ultrafast", usage: short) == nil)
