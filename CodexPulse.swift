@@ -202,8 +202,8 @@ final class RuntimeServiceTiers {
     }
 
     func tier(sessionID: String, turnID: String, timestamp: String) -> String? {
-        guard let date = dateParser.date(from: timestamp),
-              let values = observations[sessionID + ":" + turnID] else { return nil }
+        guard let values = observations[sessionID + ":" + turnID],
+              let date = dateParser.date(from: timestamp) else { return nil }
         let time = date.timeIntervalSince1970
         var lower = 0
         var upper = values.count
@@ -1478,12 +1478,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let date = fractionalISO.date(from: timestamp) ?? plainISO.date(from: timestamp) else { return false }
             return date >= startOfToday && date < startOfTomorrow
         }
-        let todayRecords = store.records.filter { record in
+        // Both collections are sorted newest first. Scan a conservative UTC
+        // date window before parsing timestamps, including timezone offsets
+        // and daylight-saving boundaries. Old history can be very large.
+        let cutoff = isoFormatter.string(from: startOfToday.addingTimeInterval(-48 * 60 * 60))
+        let cutoffDay = String(cutoff.prefix(10))
+        let todayRecords = store.records.prefix { String($0.timestamp.prefix(10)) >= cutoffDay }.filter { record in
             isToday(record.timestamp)
         }
         let todayCalls = todayRecords.reduce(0) { $0 + ($1.modelCalls ?? 0) }
         let todayTokens = todayRecords.reduce(0) { $0 + $1.usage.total }
-        let todayAPICalls = store.apiCalls.filter { call in
+        let todayAPICalls = store.apiCalls.prefix { String($0.timestamp.prefix(10)) >= cutoffDay }.filter { call in
             isToday(call.timestamp)
         }
         return PopoverMetrics(todayCalls: todayCalls, todayTokens: todayTokens,
